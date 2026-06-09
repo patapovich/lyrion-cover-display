@@ -695,14 +695,17 @@ class Display:
 
     # Backdrop matching lms-material's now-playing: the cover scaled to fill,
     # `saturate(3)` then a heavy blur, `scale(1.35)` zoom, and a translucent dark
-    # Backdrop = lms-material `.np-full .np-bgnd-cover`: `saturate(3)` (exact CSS
-    # matrix), a heavy blur, `transform: scale(1.35)`, and a dim. We dim by
-    # MULTIPLYING brightness (keeps the cover's hue — lms's "colour from cover"
-    # theme stays hued, unlike a neutral-grey veil which goes muddy). Recomputed
-    # only when the cover changes (cached by the cover surface).
+    # Backdrop = lms-material `.np-full .np-bgnd-cover`, faithfully:
+    #   filter: saturate(3) blur(...)  ->  transform: scale(1.35)
+    #   box-shadow: inset 100vw 100vh rgba(48,48,48,0.8)  (dark theme = uniform tint)
+    # Saturate is applied FIRST, at full res (CSS filter order): saturating before
+    # the blur's averaging keeps each pixel's chroma, so the averaged wash stays
+    # hued. The 0.8 grey blend then mutes the saturate(3) boost back to lms's hue.
+    # Recomputed only when the cover changes (cached by the cover surface).
     _BG_SAT = 3.0
     _BG_ZOOM = 1.35
-    _BG_DARKEN = 0.5                            # multiply brightness (hue-preserving)
+    _BG_TINT = (48, 48, 48)                     # dark-theme --np-bgnd-full-shadow-color
+    _BG_TINT_ALPHA = 204                        # 0.8 × 255
     # Blur from lms's value: `--np-full-bgnd-filter-size` is 35px at the phone
     # breakpoint (<800px), applied to a ~680px portrait viewport. The downscale
     # thumbnail width = viewport/filter encodes that same blur-to-width ratio;
@@ -720,18 +723,21 @@ class Display:
             return self._bg_surf                # cached: cover unchanged
         cw, ch = self.cw, self.ch
         base = self._crop_fill(cover, cw, ch)
-        # Saturate THEN blur (CSS filter order). Thumbnail width = viewport/filter
-        # (lms blur-to-width ratio); blur is the upscale back from this thumbnail.
+        # saturate(3) FIRST, full res (preserves chroma through the blur average),
+        # THEN blur = downscale to the lms-ratio thumbnail and upscale back.
+        sat = self._saturate(base, self._BG_SAT)
         tw = max(6, round(self._LMS_VIEWPORT_W / self._LMS_FILTER_PX))
         th = max(6, round(tw * ch / cw))
-        thumb = self._saturate(pygame.transform.smoothscale(base, (tw, th)),
-                               self._BG_SAT)
+        thumb = pygame.transform.smoothscale(sat, (tw, th))
         zw, zh = round(cw * self._BG_ZOOM), round(ch * self._BG_ZOOM)
         bg = self._blur_up(thumb, zw, zh)
         bg = bg.subsurface(((zw - cw) // 2, (zh - ch) // 2, cw, ch)).copy()  # scale(1.35)
-        # Dim by multiplying brightness — preserves hue (no grey wash).
-        g = int(self._BG_DARKEN * 255)
-        bg.fill((g, g, g), special_flags=pygame.BLEND_MULT)
+        # Uniform 0.8 blend toward dark grey (their inset box-shadow) — mutes the
+        # oversaturation to lms's hue without going fully grey.
+        veil = pygame.Surface((cw, ch))
+        veil.fill(self._BG_TINT)
+        veil.set_alpha(self._BG_TINT_ALPHA)
+        bg.blit(veil, (0, 0))
         self._bg_for, self._bg_surf = cover, bg
         return bg
 
