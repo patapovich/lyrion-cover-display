@@ -1,0 +1,14 @@
+#!/bin/sh
+# initramfs-tools HOOK: bundle the boot splash image into the initramfs so the
+# premount script can paint it before the root filesystem is mounted (~3s).
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+mkdir -p "${DESTDIR}/etc/coversplash"
+cp -f __APPDIR__/assets/splash.raw \
+      "${DESTDIR}/etc/coversplash/splash.raw" 2>/dev/null || true

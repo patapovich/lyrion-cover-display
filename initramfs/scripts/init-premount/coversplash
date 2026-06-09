@@ -1,0 +1,35 @@
+#!/bin/sh
+# initramfs-tools init-premount SCRIPT: paint the boot splash to /dev/fb0 as
+# early as possible (the firmware framebuffer is up ~1s, before the rootfs is
+# mounted). A single paint — the framebuffer content persists (no modeset; fbcon
+# is detached) and is shown the instant the HDMI scaler finishes its cold-boot
+# image-lock. splash-fb.service / the app re-assert the same image later.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+RAW=/etc/coversplash/splash.raw
+[ -r "$RAW" ] || exit 0
+
+# Detach the framebuffer text console so nothing repaints over the splash.
+for v in /sys/class/vtconsole/vtcon*; do
+    case "$(cat "$v/name" 2>/dev/null)" in
+        *rame*buffer*) echo 0 > "$v/bind" 2>/dev/null ;;
+    esac
+done
+
+# Wait briefly for the framebuffer at 1600x1200, then paint ONCE. udev may not
+# have made the node yet this early, so create it.
+i=0
+while [ "$i" -lt 60 ]; do
+    if [ "$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)" = "1600,1200" ]; then
+        [ -e /dev/fb0 ] || mknod /dev/fb0 c 29 0 2>/dev/null
+        cat "$RAW" > /dev/fb0 2>/dev/null
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+exit 0

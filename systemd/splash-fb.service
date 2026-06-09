@@ -1,0 +1,11 @@
+[Unit]
+Description=Boot splash on the framebuffer (early, repainting, slow-scaler friendly)
+DefaultDependencies=no
+After=systemd-vconsole-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/splash-fb
+
+[Install]
+WantedBy=sysinit.target

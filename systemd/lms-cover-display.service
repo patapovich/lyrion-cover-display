@@ -1,0 +1,38 @@
+[Unit]
+Description=Lyrion Cover Display (kiosk album art screen)
+# Start as early as possible: the app only needs the rootfs + the DRM device
+# (not the network, not user sessions). Ordering after dev-dri-card0.device also
+# prevents the first KMS attempt from racing the vc4 driver.
+# No network-online wait: the app polls/retries LMS itself.
+Wants=dev-dri-card0.device
+After=dev-dri-card0.device local-fs.target getty@tty1.service
+Conflicts=getty@tty1.service
+# Never give up: a kiosk must self-heal, never sit dark. systemd's default
+# rate-limit (5 starts/10s) would drop it into a permanent failed state on a
+# crash loop; 0 disables that so it keeps retrying through transient faults.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# install.sh substitutes the real user/paths into the installed copy.
+User=__USER__
+WorkingDirectory=__APPDIR__
+Environment=SDL_VIDEODRIVER=dummy
+Environment=SDL_AUDIODRIVER=dummy
+ExecStart=/usr/bin/python3 __APPDIR__/lms_cover_display.py
+# Run on tty1 so KMS/DRM has a console to grab.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+# SIGTERM cleanup is instant (finally-block); cap the worst case so a restart
+# never freezes the panel for systemd's 90s default.
+TimeoutStopSec=10
+# Safety on the 512MB Pi: OOM-kill our own process (-> restart) rather than a
+# random victim. Resident is ~50-80MB, so this is generous headroom.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

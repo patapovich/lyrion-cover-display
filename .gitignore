@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local config (copy config.example.ini -> config.ini and edit)
+config.ini
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~
+
+# Deploy backups
+*.bak
+*.bak-predeploy
+*.original.md
