@@ -64,7 +64,7 @@ DEFAULTS = {
     "background": "blur",          # "blur" | "black"
     "rotate": "90",                # rotate the rendered image: 0|90|180|270 (panel mounted portrait)
     "info_height": "0.30",         # >0 = stacked layout (cover as a 1:1 square at top, info band below); 0 = legacy centered. In portrait the band height is derived (ch-cw), so the value only selects the layout.
-    "info_wash": "150",            # extra darkening alpha (0-255) of the background under the info band
+    "info_wash": "70",             # light darkening alpha (0-255) under the info band; kept low so the blurred backdrop stays visible there (text has its own shadow)
     "show_album": "true",          # include album line in the overlay
     "request_timeout": "5.0",      # HTTP timeout (seconds)
     # When idle/powered-off, physically power the HDMI output off (not just a
@@ -691,12 +691,16 @@ class Display:
 
     # Backdrop matching lms-material's now-playing: the cover scaled to fill,
     # `saturate(3)` then a heavy blur, `scale(1.35)` zoom, and a translucent dark
-    # tint (their dark-theme inset shadow rgba(48,48,48,0.8)). Recomputed only when
-    # the cover changes (cached by the cover surface).
+    # tint. lms's literal rgba(48,48,48,0.8) is applied as an edge-weighted inset
+    # shadow, so the visible result is far lighter than a uniform veil — we mirror
+    # that with a LIGHT vertical gradient (vivid at the cover, gently darker toward
+    # the text band) so the saturated blur stays clearly visible. Recomputed only
+    # when the cover changes (cached by the cover surface).
     _BG_SAT = 3.0
     _BG_ZOOM = 1.35
-    _BG_TINT = (48, 48, 48)
-    _BG_TINT_ALPHA = 204                       # 0.8 × 255
+    _BG_TINT = (16, 16, 20)
+    _BG_VEIL_TOP = 56                          # ~0.22 alpha at the top
+    _BG_VEIL_BOT = 122                         # ~0.48 alpha at the bottom
 
     def _background(self, cover):
         pygame = self.pygame
@@ -717,12 +721,25 @@ class Display:
         zw, zh = round(cw * self._BG_ZOOM), round(ch * self._BG_ZOOM)
         bg = self._blur_up(thumb, zw, zh)
         bg = bg.subsurface(((zw - cw) // 2, (zh - ch) // 2, cw, ch)).copy()  # zoom-crop
-        veil = pygame.Surface((cw, ch))
-        veil.fill(self._BG_TINT)
-        veil.set_alpha(self._BG_TINT_ALPHA)
-        bg.blit(veil, (0, 0))
+        bg.blit(self._bg_veil(), (0, 0))
         self._bg_for, self._bg_surf = cover, bg
         return bg
+
+    def _bg_veil(self):
+        """Cached light top→bottom darkening gradient laid over the backdrop."""
+        v = getattr(self, "_veil_surf", None)
+        if v is not None:
+            return v
+        pygame = self.pygame
+        cw, ch = self.cw, self.ch
+        r, g, b = self._BG_TINT
+        top, bot = self._BG_VEIL_TOP, self._BG_VEIL_BOT
+        v = pygame.Surface((cw, ch), pygame.SRCALPHA)
+        for y in range(ch):
+            a = int(top + (bot - top) * (y / max(1, ch - 1)))
+            pygame.draw.line(v, (r, g, b, a), (0, y), (cw, y))
+        self._veil_surf = v
+        return v
 
     def _cover_shadow(self, band_top):
         """A soft drop shadow cast *down* from the cover's bottom edge onto the
