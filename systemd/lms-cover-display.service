@@ -1,11 +1,12 @@
 [Unit]
 Description=Lyrion Cover Display (kiosk album art screen)
-# Start as early as possible: the app only needs the rootfs + the DRM device
-# (not the network, not user sessions). Ordering after dev-dri-card0.device also
-# prevents the first KMS attempt from racing the vc4 driver.
-# No network-online wait: the app polls/retries LMS itself.
-Wants=dev-dri-card0.device
-After=dev-dri-card0.device local-fs.target getty@tty1.service
+# Start as early as possible: the app only needs the rootfs (for its assets) and
+# writes the firmware framebuffer (/dev/fb0) directly — it does NOT use DRM/KMS
+# (vc4 is disabled, so /dev/dri never appears). Do NOT depend on
+# dev-dri-card0.device: that device never shows, so Wants+After on it stalls boot
+# ~90s on DefaultDeviceTimeoutSec. No network-online wait either: the app
+# polls/retries LMS itself.
+After=local-fs.target getty@tty1.service
 Conflicts=getty@tty1.service
 # Never give up: a kiosk must self-heal, never sit dark. systemd's default
 # rate-limit (5 starts/10s) would drop it into a permanent failed state on a
