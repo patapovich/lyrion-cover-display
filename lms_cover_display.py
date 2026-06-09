@@ -705,7 +705,7 @@ class Display:
     _BG_SAT = 3.0
     _BG_ZOOM = 1.35
     _BG_TINT = (48, 48, 48)                     # dark-theme --np-bgnd-full-shadow-color
-    _BG_TINT_ALPHA = 204                        # 0.8 × 255
+    _BG_TINT_ALPHA = 224                        # ~0.88 × 255 (a touch darker than lms's 0.8)
     # Blur from lms's value: `--np-full-bgnd-filter-size` is 35px at the phone
     # breakpoint (<800px), applied to a ~680px portrait viewport. The downscale
     # thumbnail width = viewport/filter encodes that same blur-to-width ratio;
