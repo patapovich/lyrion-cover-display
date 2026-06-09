@@ -620,7 +620,7 @@ class Display:
         # (Surface.convert() needs a display surface, which we don't have in
         # framebuffer mode.) We fetch the artwork at its native aspect ratio
         # (cover_NxN_o.jpg), so it is shown whole, scaled to fit a 1:1 square zone;
-        # the edge-extended fill covers any margin (see _cover_geom / _cover_fill).
+        # the blurred/saturated backdrop (see _background) shows through any margin.
         surf = pygame.Surface(img.get_size())
         surf.blit(img, (0, 0))
         return surf
@@ -653,67 +653,75 @@ class Display:
             return self.ch - self._info_h
         return min(self.cw, self.ch)
 
-    def _cover_fill(self, scaled, side):
-        """A side×side fill for the square cover zone built by *edge-extending* the
-        already-scaled cover: a thin strip of each cover edge that abuts a margin is
-        stretched to fill that margin, so the margin is an exact continuation of the
-        cover's own edge (matching colour at the seam) and softens outward. The
-        sharp cover is re-drawn on top by render(); the centred copy here just keeps
-        the seam aligned and the surface gap-free."""
-        pygame = self.pygame
-        ss = pygame.transform.smoothscale
-        w, h = scaled.get_size()
-        ox, oy = (side - w) // 2, (side - h) // 2
-        surf = pygame.Surface((side, side))
-        surf.blit(scaled, (ox, oy))
-        strip = max(2, round(min(w, h) * 0.05))
+    def _saturate(self, surf, factor):
+        """Boost colour saturation by `factor` (1.0 = unchanged), each pixel pushed
+        away from its own luminance — matches CSS `filter: saturate(N)`."""
+        np = self.np
+        a = self.pygame.surfarray.array3d(surf).astype(np.float32)
+        lum = (a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114)[..., None]
+        out = np.clip(lum + factor * (a - lum), 0, 255).astype(np.uint8)
+        s = self.pygame.Surface(surf.get_size())
+        self.pygame.surfarray.blit_array(s, out)
+        return s
 
-        def soft(band, size):
-            """Stretch an edge band to `size`, heavily blurring it (collapse to a
-            tiny thumbnail then upscale) so edge text/detail averages into a smooth
-            colour wash — no streaks — while still matching the edge colour."""
-            bw, bh = size
-            band = ss(band, (max(1, min(bw, 6)), max(1, min(bh, 6))))
-            return ss(band, (bw, bh))
+    def _crop_fill(self, src, w, h):
+        """Scale `src` to COVER (w, h) keeping aspect (crop the overflow), anchored
+        centre-x / top — i.e. CSS `background-size:cover; position:center top`."""
+        ss = self.pygame.transform.smoothscale
+        iw, ih = src.get_size()
+        if iw == 0 or ih == 0:
+            return self.pygame.Surface((w, h))
+        s = max(w / iw, h / ih)
+        sw, sh = max(1, round(iw * s)), max(1, round(ih * s))
+        scaled = ss(src, (sw, sh))
+        return scaled.subsurface(((sw - w) // 2, 0, w, h)).copy()
 
-        if oy > 0:                                          # wide cover: top/bottom
-            top = scaled.subsurface((0, 0, w, strip)).copy()
-            surf.blit(soft(top, (w, oy)), (ox, 0))
-            bot = scaled.subsurface((0, h - strip, w, strip)).copy()
-            surf.blit(soft(bot, (w, side - oy - h)), (ox, oy + h))
-        if ox > 0:                                          # tall cover: left/right
-            left = scaled.subsurface((0, 0, strip, h)).copy()
-            surf.blit(soft(left, (ox, h)), (0, oy))
-            right = scaled.subsurface((w - strip, 0, strip, h)).copy()
-            surf.blit(soft(right, (side - ox - w, h)), (ox + w, oy))
-        return surf
-
-    def _blur_to(self, surf, w, h):
-        """Cheap soft blur: shrink to 16px, then upscale back to (w, h) in
-        repeated ×2 steps. A single 16→full jump leaves blocky facets on
-        high-contrast art; compounding the bilinear interpolation over several
-        passes gives a soft, gaussian-like result. Used for the background wash."""
-        pygame = self.pygame
-        out = pygame.transform.smoothscale(surf, (16, 16))
-        bw, bh = 32, 32
+    def _blur_up(self, thumb, w, h):
+        """Upscale a tiny thumbnail to (w, h) in repeated ×2 bilinear steps — a
+        cheap gaussian-like blur (compounding interpolation avoids blocky facets).
+        The thumbnail's size sets the effective blur radius."""
+        ss = self.pygame.transform.smoothscale
+        out = thumb
+        bw, bh = thumb.get_width() * 2, thumb.get_height() * 2
         while bw < w or bh < h:
-            out = pygame.transform.smoothscale(out, (min(bw, w), min(bh, h)))
+            out = ss(out, (min(bw, w), min(bh, h)))
             bw *= 2
             bh *= 2
-        return pygame.transform.smoothscale(out, (w, h))
+        return ss(out, (w, h))
+
+    # Backdrop matching lms-material's now-playing: the cover scaled to fill,
+    # `saturate(3)` then a heavy blur, `scale(1.35)` zoom, and a translucent dark
+    # tint (their dark-theme inset shadow rgba(48,48,48,0.8)). Recomputed only when
+    # the cover changes (cached by the cover surface).
+    _BG_SAT = 3.0
+    _BG_ZOOM = 1.35
+    _BG_TINT = (48, 48, 48)
+    _BG_TINT_ALPHA = 204                       # 0.8 × 255
 
     def _background(self, cover):
         pygame = self.pygame
         if self.cfg.background == "black" or cover is None:
             bg = pygame.Surface((self.cw, self.ch))
             bg.fill((8, 8, 10))
-        else:
-            bg = self._blur_to(cover, self.cw, self.ch)
-            # Darken so the foreground cover and text stay legible.
-            veil = pygame.Surface((self.cw, self.ch))
-            veil.fill((0, 0, 0))
-            veil.set_alpha(120)
-            bg.blit(veil, (0, 0))
+            return bg
+        if getattr(self, "_bg_for", None) is cover:
+            return self._bg_surf                # cached: cover unchanged
+        cw, ch = self.cw, self.ch
+        base = self._crop_fill(cover, cw, ch)
+        # Saturate THEN blur (CSS filter order). Saturate the small thumbnail —
+        # cheap, and the thumbnail size sets the blur radius (~a 50px blur here).
+        th = max(8, ch // 56)
+        tw = max(8, round(cw / ch * th))
+        thumb = self._saturate(pygame.transform.smoothscale(base, (tw, th)),
+                               self._BG_SAT)
+        zw, zh = round(cw * self._BG_ZOOM), round(ch * self._BG_ZOOM)
+        bg = self._blur_up(thumb, zw, zh)
+        bg = bg.subsurface(((zw - cw) // 2, (zh - ch) // 2, cw, ch)).copy()  # zoom-crop
+        veil = pygame.Surface((cw, ch))
+        veil.fill(self._BG_TINT)
+        veil.set_alpha(self._BG_TINT_ALPHA)
+        bg.blit(veil, (0, 0))
+        self._bg_for, self._bg_surf = cover, bg
         return bg
 
     def _cover_shadow(self, band_top):
@@ -777,11 +785,9 @@ class Display:
 
         if cover is not None:
             scaled, pos = self._scaled_cover(cover)
-            # Fill the square cover zone by edge-extending the scaled cover, so a
-            # non-square cover's margins continue its own edges (colour-matched).
-            if self._info_h > 0:
-                side = min(self.cw, self.ch)
-                screen.blit(self._cover_fill(scaled, side), ((self.cw - side) // 2, 0))
+            # The blurred/saturated backdrop (lms-material style) shows through
+            # around a non-square cover — no edge-extend fill. Draw the sharp,
+            # aspect-correct cover centred in the square zone on top.
             screen.blit(scaled, pos)
             # Soft contact shadow cast down from the cover's bottom edge.
             if self._info_h > 0:

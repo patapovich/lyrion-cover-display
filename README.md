@@ -48,7 +48,7 @@ Edit `config.ini` — full annotated list in
 | `player`             | Player MAC (recommended) or name; blank = first player         |
 | `players`            | Several players, priority order (first = highest), comma/space separated; overrides `player`. Highest-priority *playing* one shows; preempts; sticky last-active when idle |
 | `rotate`             | `0/90/180/270` for a portrait mount (default `90`)             |
-| `background`         | `blur` (soft-blurred cover) or `black`                         |
+| `background`         | `blur` (saturated, blurred, zoomed full-cover backdrop, lms-material style) or `black` |
 | `idle_blank_seconds` | Hold last cover this long after stop, then power HDMI off (default `300`) |
 
 Updates are event-driven via the LMS CLI (`cli_port`, default `9090`); set
