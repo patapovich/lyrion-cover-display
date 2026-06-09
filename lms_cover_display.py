@@ -702,10 +702,10 @@ class Display:
     # the blur's averaging keeps each pixel's chroma, so the averaged wash stays
     # hued. The 0.8 grey blend then mutes the saturate(3) boost back to lms's hue.
     # Recomputed only when the cover changes (cached by the cover surface).
-    _BG_SAT = 3.6                               # a bit above lms's saturate(3) for more vivid colour through the dark tint
+    _BG_SAT = 4.2                               # above lms's saturate(3) for more vivid colour through the dark tint
     _BG_ZOOM = 1.35
     _BG_TINT = (48, 48, 48)                     # dark-theme --np-bgnd-full-shadow-color
-    _BG_TINT_ALPHA = 236                        # ~0.93 × 255 (darker than lms's 0.8)
+    _BG_TINT_ALPHA = 244                        # ~0.96 × 255 (darker than lms's 0.8)
     # Blur from lms's value: `--np-full-bgnd-filter-size` is 35px at the phone
     # breakpoint (<800px), applied to a ~680px portrait viewport. The downscale
     # thumbnail width = viewport/filter encodes that same blur-to-width ratio;
