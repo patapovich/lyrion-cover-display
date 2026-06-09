@@ -702,7 +702,7 @@ class Display:
     # the blur's averaging keeps each pixel's chroma, so the averaged wash stays
     # hued. The 0.8 grey blend then mutes the saturate(3) boost back to lms's hue.
     # Recomputed only when the cover changes (cached by the cover surface).
-    _BG_SAT = 3.0
+    _BG_SAT = 3.6                               # a bit above lms's saturate(3) for more vivid colour through the dark tint
     _BG_ZOOM = 1.35
     _BG_TINT = (48, 48, 48)                     # dark-theme --np-bgnd-full-shadow-color
     _BG_TINT_ALPHA = 236                        # ~0.93 × 255 (darker than lms's 0.8)
