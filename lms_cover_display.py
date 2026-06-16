@@ -590,7 +590,6 @@ class Display:
         return True
 
     def _init_fonts(self):
-        pygame = self.pygame
         font_candidates = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             os.path.join(os.path.dirname(__file__), "assets", "DejaVuSans-Bold.ttf"),
@@ -599,17 +598,30 @@ class Display:
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             os.path.join(os.path.dirname(__file__), "assets", "DejaVuSans.ttf"),
         ]
-        base = max(20, self.ch // 28)
-        self.font_title = self._load_font(font_candidates, base)
-        self.font_sub = self._load_font(regular_candidates, int(base * 0.7))
-        self.font_status = self._load_font(regular_candidates, base)  # status line
+        self._font_cache = {}
+        self._base = max(20, self.ch // 28)
+        # Resolve the font files once; the text overlay re-instantiates them at
+        # smaller sizes on the fly (see _font_at) to shrink names that would
+        # otherwise overflow the info band.
+        self._font_title_path = self._resolve_font(font_candidates)
+        self._font_sub_path = self._resolve_font(regular_candidates)
+        self.font_title = self._font_at(self._font_title_path, self._base)
+        self.font_sub = self._font_at(self._font_sub_path, int(self._base * 0.7))
+        self.font_status = self._font_at(self._font_sub_path, self._base)  # status
 
-    def _load_font(self, candidates, size):
-        pygame = self.pygame
+    def _resolve_font(self, candidates):
         for path in candidates:
             if os.path.exists(path):
-                return pygame.font.Font(path, size)
-        return pygame.font.Font(None, size)  # pygame's built-in fallback
+                return path
+        return None  # pygame's built-in fallback (Font(None, size))
+
+    def _font_at(self, path, size):
+        size = max(1, int(size))
+        cached = self._font_cache.get((path, size))
+        if cached is None:
+            cached = self.pygame.font.Font(path, size)
+            self._font_cache[(path, size)] = cached
+        return cached
 
     # -- cover decoding/scaling ------------------------------------------- #
 
@@ -899,6 +911,77 @@ class Display:
         lines.append(cur)
         return lines
 
+    def _ellipsize(self, font, text, max_w):
+        """Trim `text` from the end and append … until it fits `max_w` px.
+        Last resort for a single token too wide even at the smallest font."""
+        if font.size(text)[0] <= max_w:
+            return text
+        ell = "…"
+        s = text
+        while s and font.size(s + ell)[0] > max_w:
+            s = s[:-1]
+        return (s + ell) if s else ell
+
+    def _fit_lines(self, np: NowPlaying, max_w, max_h):
+        """Pick the largest font scale at which the title/artist/album text wraps
+        within `max_w` and the whole block fits `max_h`. Shrinks toward a floor;
+        if it still won't fit, ellipsizes lines (and drops any past `max_h`) so
+        the result always fits. Returns (rendered, pad): rendered is a list of
+        (fg_surface, shadow_surface) pairs, pad is the inter-line gap in px."""
+        # (path, base_size, text, colour) for each line that is present.
+        specs = []
+        if np.title:
+            specs.append((self._font_title_path, self._base, np.title, (255, 255, 255)))
+        if np.artist:
+            specs.append((self._font_sub_path, int(self._base * 0.7), np.artist, (210, 210, 210)))
+        if self.cfg.show_album and np.album:
+            specs.append((self._font_sub_path, int(self._base * 0.7), np.album, (170, 170, 170)))
+        if not specs:
+            return [], 0
+
+        base_pad = max(16, self.ch // 48)
+        FLOOR = 0.5
+        best = None
+        scale = 1.0
+        while scale >= FLOOR - 1e-9:
+            pad = max(6, int(base_pad * scale))
+            sublines, fits = [], True
+            for path, bsz, text, colour in specs:
+                f = self._font_at(path, round(bsz * scale))
+                for sub in self._wrap(f, text, max_w):
+                    sublines.append((f, sub, colour))
+                    if f.size(sub)[0] > max_w:   # a lone word still too wide
+                        fits = False
+            total_h = (sum(f.get_height() for f, _, _ in sublines)
+                       + pad * (len(sublines) - 1))
+            if fits and total_h <= max_h:
+                best = (sublines, pad)
+                break
+            scale -= 0.05
+
+        if best is None:
+            # Floor scale: ellipsize each wrapped line to max_w, then drop lines
+            # that would spill past max_h (ellipsis already on the last kept).
+            pad = max(6, int(base_pad * FLOOR))
+            flat = []
+            for path, bsz, text, colour in specs:
+                f = self._font_at(path, round(bsz * FLOOR))
+                for sub in self._wrap(f, text, max_w):
+                    flat.append((f, self._ellipsize(f, sub, max_w), colour))
+            kept, h = [], 0
+            for f, sub, colour in flat:
+                add = f.get_height() + (pad if kept else 0)
+                if kept and h + add > max_h:
+                    break
+                kept.append((f, sub, colour))
+                h += add
+            best = (kept, pad)
+
+        sublines, pad = best
+        rendered = [(f.render(t, True, c), f.render(t, True, (0, 0, 0)))
+                    for f, t, c in sublines]
+        return rendered, pad
+
     def _text_overlay(self, np: NowPlaying):
         """Build (and cache per track) a full-screen SRCALPHA overlay holding
         the scrim + artist/title text, so render() can fade it in/out by
@@ -908,34 +991,30 @@ class Display:
             return self._ov_surf
 
         pygame = self.pygame
-        lines = []
-        if np.title:
-            lines.append((self.font_title, np.title, (255, 255, 255)))
-        if np.artist:
-            lines.append((self.font_sub, np.artist, (210, 210, 210)))
-        if self.cfg.show_album and np.album:
-            lines.append((self.font_sub, np.album, (170, 170, 170)))
-
-        if not lines:
-            self._ov_key, self._ov_surf = key, None
-            return None
-
-        pad = max(16, self.ch // 48)
+        pad0 = max(16, self.ch // 48)
         side = max(20, self.cw // 20)                 # keep text off the edges
         max_w = self.cw - 2 * side
-        rendered = []
-        for f, t, c in lines:
-            for sub in self._wrap(f, t, max_w):
-                rendered.append((f.render(sub, True, c),
-                                 f.render(sub, True, (0, 0, 0))))
+
+        # Vertical budget: in the stacked layout the text must fit the band below
+        # the cover (never rise over it); centered layout gets a generous half.
+        if self._info_h > 0:
+            band_top = getattr(self, "_cur_band_top", self.ch - self._info_h)
+            max_h = max(1, (self.ch - band_top) - 2 * pad0)
+        else:
+            band_top = None
+            max_h = int(self.ch * 0.5)
+
+        rendered, pad = self._fit_lines(np, max_w, max_h)
+        if not rendered:
+            self._ov_key, self._ov_surf = key, None
+            return None
         total_h = sum(fg.get_height() for fg, _ in rendered) + pad * (len(rendered) - 1)
 
         ov = pygame.Surface((self.cw, self.ch), pygame.SRCALPHA)
         if self._info_h > 0:
-            # Stacked layout: text centered within the band below the cover (the
-            # band itself is washed out in _background, so no scrim needed here).
-            band_top = getattr(self, "_cur_band_top", self.ch - self._info_h)
-            y = band_top + (self.ch - band_top - total_h) // 2
+            # Stacked layout: text centred within the band below the cover. The
+            # max() keeps it from ever rising over the cover even if it's tall.
+            y = max(band_top, band_top + (self.ch - band_top - total_h) // 2)
         else:
             # Centered (landscape) layout: gradient scrim + text along the bottom.
             scrim_h = total_h + pad * 3
