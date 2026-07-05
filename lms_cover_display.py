@@ -262,7 +262,9 @@ class LMSClient:
     def status(self, player: str) -> dict:
         # "-" = current track index; 1 item; tags for the fields we render.
         # a=artist l=album c=coverid K=artwork_url x=remote N=remote title
-        return self.request(player, ["status", "-", 1, "tags:aclKxN"])
+        # Two playlist entries: [0] = the current track, [1] = the upcoming
+        # track (used to prefetch its cover so song changes swap instantly).
+        return self.request(player, ["status", "-", 2, "tags:aclKxN"])
 
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +391,48 @@ class EventListener:
 # Now-playing model
 # --------------------------------------------------------------------------- #
 
+def _art_url(cfg: Config, track: dict):
+    """(cover_key, cover_url) for a status playlist_loop entry, or ("", "")
+    when the track carries no usable art identity.
+
+    Prefer artwork_url when present. Remote sources (internet radio, some
+    streams) set a synthetic/negative coverid that does NOT resolve via
+    /music/<id>/cover, but DO provide a real artwork_url (often an
+    /imageproxy/... link). Local tracks and Spotify albums have no
+    artwork_url, so they fall to coverid.
+
+    We never fetch remote art directly: a bare /imageproxy/<enc>/image.png
+    301-redirects to the remote (often https), and this Pi has no RTC — at
+    boot the clock is stale until NTP, so the CDN's TLS cert reads "not
+    yet valid" and the cover fails. Adding a size spec (image_NxN_o.jpg)
+    makes LMS fetch + resize server-side and return the bytes itself, so
+    the Pi only ever does plain LAN HTTP to LMS, clock-independent. The .jpg
+    spec (covers have no alpha) is ~6x smaller than the .png form and much
+    faster to decode on the Pi."""
+    coverid = track.get("coverid")
+    artwork_url = track.get("artwork_url")
+    px = cfg.cover_px
+    if artwork_url:
+        key = f"url:{artwork_url}"
+        if artwork_url.startswith(cfg.base_url):
+            artwork_url = artwork_url[len(cfg.base_url):]  # absolute-to-LMS
+        if artwork_url.startswith("http"):
+            # External absolute URL: route through the LMS imageproxy.
+            return key, (f"{cfg.base_url}/imageproxy/"
+                         f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.jpg")
+        rel = artwork_url.lstrip("/")
+        if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
+            rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.jpg"
+        return key, f"{cfg.base_url}/{rel}"
+    if coverid:
+        # The _o suffix = keep the artwork's native aspect, max dimension px,
+        # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
+        # blur-fill ourselves, so we want the original aspect ratio.
+        return (f"cid:{coverid}",
+                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.jpg")
+    return "", ""
+
+
 @dataclass
 class NowPlaying:
     mode: str = "stop"           # play | pause | stop
@@ -397,6 +441,8 @@ class NowPlaying:
     album: str = ""
     cover_key: str = ""          # identity used to detect art changes
     cover_url: str = ""          # absolute URL to fetch the cover from
+    next_cover_key: str = ""     # upcoming track's art identity (prefetch)
+    next_cover_url: str = ""     # upcoming track's art URL (prefetch)
 
     @staticmethod
     def parse(cfg: Config, status: dict) -> "NowPlaying":
@@ -409,48 +455,20 @@ class NowPlaying:
         np.artist = track.get("artist", "") or track.get("albumartist", "")
         np.album = track.get("album", "")
 
-        coverid = track.get("coverid")
-        artwork_url = track.get("artwork_url")
-        px = cfg.cover_px
-
-        # Prefer artwork_url when present. Remote sources (internet radio, some
-        # streams) set a synthetic/negative coverid that does NOT resolve via
-        # /music/<id>/cover, but DO provide a real artwork_url (often an
-        # /imageproxy/... link). Local tracks and Spotify albums have no
-        # artwork_url, so they fall to coverid.
-        #
-        # We never fetch remote art directly: a bare /imageproxy/<enc>/image.png
-        # 301-redirects to the remote (often https), and this Pi has no RTC — at
-        # boot the clock is stale until NTP, so the CDN's TLS cert reads "not
-        # yet valid" and the cover fails. Adding a size spec (image_NxN_o.png)
-        # makes LMS fetch + resize server-side and return the bytes itself, so
-        # the Pi only ever does plain LAN HTTP to LMS, clock-independent.
-        if artwork_url:
-            np.cover_key = f"url:{artwork_url}"
-            if artwork_url.startswith(cfg.base_url):
-                artwork_url = artwork_url[len(cfg.base_url):]  # absolute-to-LMS
-            if artwork_url.startswith("http"):
-                # External absolute URL: route through the LMS imageproxy.
-                np.cover_url = (f"{cfg.base_url}/imageproxy/"
-                                f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
-            else:
-                rel = artwork_url.lstrip("/")
-                if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
-                    rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
-                np.cover_url = f"{cfg.base_url}/{rel}"
-        elif coverid:
-            np.cover_key = f"cid:{coverid}"
-            # The _o suffix = keep the artwork's native aspect, max dimension px,
-            # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
-            # blur-fill ourselves, so we want the original aspect ratio.
-            np.cover_url = f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.jpg"
-        else:
+        np.cover_key, np.cover_url = _art_url(cfg, track)
+        if not np.cover_key:
             # Last resort: the "current cover" shortcut for this player.
-            np.cover_key = "current"
+            px = cfg.cover_px
             pid = status.get("playerid", "")
+            np.cover_key = "current"
             np.cover_url = (
                 f"{cfg.base_url}/music/current/cover_{px}x{px}_o.jpg?player={quote(pid)}"
             )
+        # The sweep asks for two playlist entries; entry [1] is the upcoming
+        # track, whose art we prefetch so the swap at the song change is
+        # instant. Only real identities are prefetchable (no "current" form).
+        if len(loop) > 1:
+            np.next_cover_key, np.next_cover_url = _art_url(cfg, loop[1])
         return np
 
 
@@ -744,8 +762,15 @@ class Display:
             bg = pygame.Surface((self.cw, self.ch))
             bg.fill((8, 8, 10))
             return bg
-        if getattr(self, "_bg_for", None) is cover:
-            return self._bg_surf                # cached: cover unchanged
+        # Keyed cache (current + prefetched next). id() is safe as the key only
+        # because the entry also holds the cover ref (keeps it alive, so its id
+        # can't be reused while cached).
+        cache = getattr(self, "_bg_cache", None)
+        if cache is None:
+            cache = self._bg_cache = {}
+        hit = cache.get(id(cover))
+        if hit is not None and hit[0] is cover:
+            return hit[1]
         cw, ch = self.cw, self.ch
         base = self._crop_fill(cover, cw, ch)
         # saturate(3) FIRST, full res (preserves chroma through the blur average),
@@ -763,8 +788,20 @@ class Display:
         veil.fill(self._BG_TINT)
         veil.set_alpha(self._BG_TINT_ALPHA)
         bg.blit(veil, (0, 0))
-        self._bg_for, self._bg_surf = cover, bg
+        # Cap 4: current + prefetched next + slack for the transient double
+        # key-change LMS emits while a track loads (placeholder art first) —
+        # with only 2 slots that churn evicted the prewarmed backdrop and the
+        # swap paid a full recompute (~1s) despite the cover-cache hit.
+        while len(cache) >= 4:
+            cache.pop(next(iter(cache)))
+        cache[id(cover)] = (cover, bg)
         return bg
+
+    def prewarm_background(self, cover):
+        """Compute (and cache) the backdrop for a not-yet-shown cover, so the
+        render at the actual song change is a pure cache hit."""
+        if self.cfg.background != "black":
+            self._background(cover)
 
     def _cover_shadow(self, band_top):
         """A soft drop shadow cast *down* from the cover's bottom edge onto the
@@ -1241,6 +1278,9 @@ def run(cfg: Config):
     last_key = None
     cover_retry_key = None    # cover_key being re-fetched after a failed attempt
     cover_retry_n = 0         # bounded fast retries for that key (stale-clock etc.)
+    prefetch_failed_key = None  # next-cover key that failed; one attempt only
+    art_t0 = None             # art change detected at this time (for the log line)
+    art_src = ""              # "prefetched" (cache hit) or "fetched"
     last_track = None         # (title, artist, album, cover_key) — detects track changes
     last_state_id = None      # render identity, to avoid needless redraws
     idle_since = None         # entered stop / paused-blank at this monotonic time
@@ -1323,6 +1363,7 @@ def run(cfg: Config):
                         last_track = None
                         last_state_id = None
                         text_until = 0.0
+                        prefetch_failed_key = None
 
                     np, power = polls[selected]
                     # "Engaged" = audio active (play, or pause kept lit): drives the
@@ -1339,7 +1380,9 @@ def run(cfg: Config):
                                           else now + show_secs + fade)
                         # Fetch cover only when the art identity changes.
                         if np.cover_key and np.cover_key != last_key:
+                            art_t0 = time.monotonic()
                             surf = cover_cache.get(np.cover_key)
+                            art_src = "prefetched" if surf is not None else "fetched"
                             if surf is None:
                                 surf = _fetch_cover(client, display, np.cover_url)
                                 if surf is not None:
@@ -1368,6 +1411,7 @@ def run(cfg: Config):
                                     cover_retry_n += 1
                                     heartbeat_at = min(heartbeat_at,
                                                        now + COVER_RETRY)
+                                art_t0 = None   # nothing painted; no timing line
                         was_playing = True
                     else:
                         was_playing = False
@@ -1468,6 +1512,11 @@ def run(cfg: Config):
                     if state_id != last_state_id or display.blanked:
                         display.render(cover_surface, np, alpha)
                         last_state_id = state_id
+                        if art_t0 is not None:
+                            print(f"art swap painted in "
+                                  f"{(time.monotonic() - art_t0) * 1000:.0f}ms "
+                                  f"({art_src})", flush=True)
+                            art_t0 = None
                 elif state == S_UNREACHABLE:
                     # Server/wifi blip: hold whatever is on screen (usually the last
                     # cover) so a brief outage is invisible. Only after the grace —
@@ -1488,6 +1537,30 @@ def run(cfg: Config):
             except Exception as exc:  # noqa: BLE001  (render/fb/vcgencmd hiccup)
                 print(f"[error] render/power step failed: {exc}", flush=True)
                 last_state_id = None      # force a clean redraw next iteration
+
+            # --- prefetch the upcoming track's cover + backdrop ------------- #
+            # The sweep already carries the next playlist entry; pulling its
+            # art now (once, guarded by the cache) makes the swap at the song
+            # change a pure cache hit — no network/decode in the critical
+            # path. Blocking is fine here: events queue in the socket buffer
+            # and are drained on the next loop.
+            if (playing and np.next_cover_key
+                    and np.next_cover_key != np.cover_key
+                    and np.next_cover_key not in cover_cache
+                    and np.next_cover_key != prefetch_failed_key):
+                surf = _fetch_cover(client, display, np.next_cover_url)
+                if surf is not None:
+                    cover_cache[np.next_cover_key] = surf
+                    _trim_cache(cover_cache)
+                    try:
+                        display.prewarm_background(surf)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[warn] backdrop prewarm failed: {exc}",
+                              flush=True)
+                else:
+                    # One attempt per key: the normal change-path (with its
+                    # bounded retry) covers it if this track actually plays.
+                    prefetch_failed_key = np.next_cover_key
 
             # --- wait for a pushed event, or until the next required deadline ---
             now = time.monotonic()
@@ -1532,7 +1605,7 @@ def _fetch_cover(client: LMSClient, display: Display, url: str):
         return None
 
 
-def _trim_cache(cache: dict, limit: int = 8):
+def _trim_cache(cache: dict, limit: int = 6):
     while len(cache) > limit:
         cache.pop(next(iter(cache)))
 
