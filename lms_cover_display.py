@@ -416,14 +416,28 @@ class NowPlaying:
         # Prefer artwork_url when present. Remote sources (internet radio, some
         # streams) set a synthetic/negative coverid that does NOT resolve via
         # /music/<id>/cover, but DO provide a real artwork_url (often an
-        # /imageproxy/... link that 301-redirects to the real image). Local
-        # tracks and Spotify albums have no artwork_url, so they fall to coverid.
+        # /imageproxy/... link). Local tracks and Spotify albums have no
+        # artwork_url, so they fall to coverid.
+        #
+        # We never fetch remote art directly: a bare /imageproxy/<enc>/image.png
+        # 301-redirects to the remote (often https), and this Pi has no RTC — at
+        # boot the clock is stale until NTP, so the CDN's TLS cert reads "not
+        # yet valid" and the cover fails. Adding a size spec (image_NxN_o.png)
+        # makes LMS fetch + resize server-side and return the bytes itself, so
+        # the Pi only ever does plain LAN HTTP to LMS, clock-independent.
         if artwork_url:
             np.cover_key = f"url:{artwork_url}"
+            if artwork_url.startswith(cfg.base_url):
+                artwork_url = artwork_url[len(cfg.base_url):]  # absolute-to-LMS
             if artwork_url.startswith("http"):
-                np.cover_url = artwork_url
+                # External absolute URL: route through the LMS imageproxy.
+                np.cover_url = (f"{cfg.base_url}/imageproxy/"
+                                f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
             else:
-                np.cover_url = f"{cfg.base_url}/{artwork_url.lstrip('/')}"
+                rel = artwork_url.lstrip("/")
+                if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
+                    rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
+                np.cover_url = f"{cfg.base_url}/{rel}"
         elif coverid:
             np.cover_key = f"cid:{coverid}"
             # The _o suffix = keep the artwork's native aspect, max dimension px,
@@ -505,8 +519,6 @@ class Display:
         up by the firmware (1600x1200x32) and persists for the whole session —
         no modeset, so the HDMI output never drops."""
         import mmap
-        import numpy as np
-        self.np = np
 
         def _read(name, default=""):
             try:
@@ -667,18 +679,19 @@ class Display:
 
     def _saturate(self, surf, s):
         """Apply CSS `filter: saturate(s)` exactly — the W3C/SVG saturate matrix
-        (Rec.709 luma coefficients 0.213 / 0.715 / 0.072)."""
-        np = self.np
-        a = self.pygame.surfarray.array3d(surf).astype(np.float32)
-        r, g, b = a[..., 0], a[..., 1], a[..., 2]
-        out = np.empty_like(a)
-        out[..., 0] = (0.213 + 0.787 * s) * r + (0.715 - 0.715 * s) * g + (0.072 - 0.072 * s) * b
-        out[..., 1] = (0.213 - 0.213 * s) * r + (0.715 + 0.285 * s) * g + (0.072 - 0.072 * s) * b
-        out[..., 2] = (0.213 - 0.213 * s) * r + (0.715 - 0.715 * s) * g + (0.072 + 0.928 * s) * b
-        out = np.clip(out, 0, 255).astype(np.uint8)
-        res = self.pygame.Surface(surf.get_size())
-        self.pygame.surfarray.blit_array(res, out)
-        return res
+        (Rec.709 luma coefficients 0.213 / 0.715 / 0.072). Algebraically each
+        channel of that matrix is `luma*(1-s) + channel*s`, i.e. a blend past
+        the Rec.709 grayscale image — which PIL's Image.blend computes at C
+        speed, extrapolating and clipping for s > 1, at full resolution.
+        (PIL replaced numpy here: dropping numpy cuts ~4s of cold-boot import
+        on the Pi's SD card; PIL imports in well under a second.)"""
+        from PIL import Image
+        pygame = self.pygame
+        w, h = surf.get_size()
+        img = Image.frombytes("RGB", (w, h), pygame.image.tostring(surf, "RGB"))
+        gray = img.convert("L", (0.213, 0.715, 0.072, 0))
+        out = Image.blend(Image.merge("RGB", (gray, gray, gray)), img, s)
+        return pygame.image.fromstring(out.tobytes(), (w, h), "RGB")
 
     def _crop_fill(self, src, w, h):
         """Scale `src` to COVER (w, h) keeping aspect (crop the overflow), anchored
@@ -869,30 +882,36 @@ class Display:
     def present(self):
         self._blit_to_fb()
 
-    def _orient(self, arr):
-        """Rotate the row-major (ch,cw,3) canvas image to the physical (h,w,3)
-        framebuffer orientation. The fb is fixed landscape; for a 90/270 mount we
-        composed portrait and rotate here at scanout."""
-        k = {0: 0, 90: 3, 180: 2, 270: 1}[self.rot]
-        return self.np.rot90(arr, k) if k else arr
+    # Canvas-to-panel rotation as a pygame angle (positive = counterclockwise).
+    # rot=90 means "canvas composed portrait, panel mounted 90° cw" — the frame
+    # must be rotated 90° clockwise (-90) back to the fb's fixed landscape.
+    _ROT_ANGLE = {0: 0, 90: -90, 180: 180, 270: 90}
 
     def _blit_to_fb(self):
-        np = self.np
-        arr = np.transpose(self.pygame.surfarray.array3d(self.screen), (1, 0, 2))  # (ch,cw,3) RGB
-        arr = self._orient(arr)                         # rotate to (h,w,3)
-        out = np.empty((self.h, self.w, 4), np.uint8)   # 32-bit BGRX (firmware fb order)
-        out[..., 0] = arr[..., 2]                       # B
-        out[..., 1] = arr[..., 1]                       # G
-        out[..., 2] = arr[..., 0]                       # R
-        out[..., 3] = 255                               # X / alpha (ignored)
-        buf = out.tobytes()
+        pygame = self.pygame
+        surf = self.screen
+        angle = self._ROT_ANGLE[self.rot]
+        if angle:
+            surf = pygame.transform.rotate(surf, angle)   # (cw,ch) -> (w,h)
+        # Persistent surface whose pixel layout IS the firmware fb's 32-bit
+        # BGRX (little-endian XRGB8888): blitting into it converts at C speed,
+        # and its raw buffer copies to the fb without any per-byte shuffling.
+        # (pygame 2.1.2 has no BGR* tostring format, hence this route; it also
+        # replaced the old numpy pack — dropping numpy cuts ~4s of cold boot.)
+        fbs = getattr(self, "_fbsurf", None)
+        if fbs is None:
+            fbs = self._fbsurf = pygame.Surface(
+                (self.w, self.h), 0, 32, (0xFF0000, 0xFF00, 0xFF, 0))
+        fbs.blit(surf, (0, 0))
+        buf = bytes(fbs.get_view("0"))
+        pitch = fbs.get_pitch()
         row = self.w * 4
-        if self.stride == row:
+        if self.stride == pitch:
             self._fb[:len(buf)] = buf
         else:
             for y in range(self.h):
                 off = y * self.stride
-                self._fb[off:off + row] = buf[y * row:(y + 1) * row]
+                self._fb[off:off + row] = buf[y * pitch:y * pitch + row]
 
     def _wrap(self, font, text, max_w):
         """Greedy word-wrap `text` to fit `max_w` px, never splitting a word.
