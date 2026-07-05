@@ -1220,6 +1220,8 @@ def run(cfg: Config):
     cover_surface = None
     cover_cache = {}          # cover_key -> decoded surface
     last_key = None
+    cover_retry_key = None    # cover_key being re-fetched after a failed attempt
+    cover_retry_n = 0         # bounded fast retries for that key (stale-clock etc.)
     last_track = None         # (title, artist, album, cover_key) — detects track changes
     last_state_id = None      # render identity, to avoid needless redraws
     idle_since = None         # entered stop / paused-blank at this monotonic time
@@ -1233,6 +1235,8 @@ def run(cfg: Config):
     dirty = True              # force the first sweep; set by pushed events
     heartbeat_at = 0.0        # next safety re-sweep deadline
     FRAME = 1.0 / 30          # animation tick during the text fade
+    COVER_RETRY = 3.0         # re-fetch a failed cover this often (fast)…
+    COVER_RETRY_MAX = 20      # …up to this many tries, then rely on the heartbeat
     fade = max(0.0, cfg.text_fade_seconds)
     # In the stacked layout the bottom band is a dedicated info area, so keep the
     # text on permanently (0 = always-on); only the centered layout fades it out.
@@ -1326,7 +1330,25 @@ def run(cfg: Config):
                             # no-cover for this key so we show the status screen
                             # rather than the *previous* track's cover.
                             cover_surface = surf
-                            last_key = np.cover_key
+                            if surf is not None:
+                                # Success: stop re-fetching this key.
+                                last_key = np.cover_key
+                                cover_retry_key = None
+                            else:
+                                # Fetch failed — e.g. a stale boot clock (no RTC +
+                                # ro overlay can't persist fake-hwclock) makes the
+                                # cover CDN's TLS cert read "not yet valid" until NTP
+                                # syncs. Do NOT advance last_key: keep showing status,
+                                # but re-fetch this same key soon instead of caching
+                                # the miss until the track changes. Bounded, then we
+                                # fall back to the normal heartbeat re-sweep.
+                                if np.cover_key != cover_retry_key:
+                                    cover_retry_key = np.cover_key
+                                    cover_retry_n = 0
+                                if cover_retry_n < COVER_RETRY_MAX:
+                                    cover_retry_n += 1
+                                    heartbeat_at = min(heartbeat_at,
+                                                       now + COVER_RETRY)
                         was_playing = True
                     else:
                         was_playing = False
