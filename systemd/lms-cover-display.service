@@ -6,18 +6,8 @@ Description=Lyrion Cover Display (kiosk album art screen)
 # dev-dri-card0.device: that device never shows, so Wants+After on it stalls boot
 # ~90s on DefaultDeviceTimeoutSec. No network-online wait either: the app
 # polls/retries LMS itself.
-# Early start: skip the default sysinit/basic.target wait (~2.4s on this Pi).
-# Everything the app touches is up long before those: the rootfs (/usr, /home)
-# is mounted before systemd runs, /dev/fb0 comes from devtmpfs + the built-in
-# fb driver, and stdout goes to the journald socket. DefaultDependencies=no
-# drops the implicit After=basic.target; order only after journald + the
-# local-fs preparation point, and keep an explicit clean-shutdown conflict
-# (normally implied) so SIGTERM cleanup still runs on reboot/poweroff.
-DefaultDependencies=no
-After=local-fs-pre.target systemd-journald.socket
-Wants=local-fs-pre.target
-Conflicts=getty@tty1.service shutdown.target
-Before=shutdown.target
+After=local-fs.target getty@tty1.service
+Conflicts=getty@tty1.service
 # Never give up: a kiosk must self-heal, never sit dark. systemd's default
 # rate-limit (5 starts/10s) would drop it into a permanent failed state on a
 # crash loop; 0 disables that so it keeps retrying through transient faults.
@@ -25,11 +15,6 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Starting before udev's coldplug means /dev/fb0 and /dev/vchiq may still have
-# their bare devtmpfs permissions (root-only), which would crash the un-priv
-# user's first open into a restart loop. Grant the video group up front ('+'
-# runs this one line as root); udev applies the same group moments later.
-ExecStartPre=+/bin/sh -c 'chgrp video /dev/fb0 /dev/vchiq 2>/dev/null; chmod g+rw /dev/fb0 /dev/vchiq 2>/dev/null; true'
 # install.sh substitutes the real user/paths into the installed copy.
 User=__USER__
 WorkingDirectory=__APPDIR__
