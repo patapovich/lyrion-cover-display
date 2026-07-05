@@ -1,6 +1,6 @@
 #!/bin/sh
 # initramfs-tools HOOK: bundle the boot splash image into the initramfs so the
-# premount script can paint it before the root filesystem is mounted (~3s).
+# init-top script can paint it before the initramfs udev step (~2s).
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case "$1" in

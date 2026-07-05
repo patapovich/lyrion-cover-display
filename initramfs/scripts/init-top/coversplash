@@ -1,9 +1,11 @@
 #!/bin/sh
-# initramfs-tools init-premount SCRIPT: paint the boot splash to /dev/fb0 as
-# early as possible (the firmware framebuffer is up ~1s, before the rootfs is
-# mounted). A single paint — the framebuffer content persists (no modeset; fbcon
-# is detached) and is shown the instant the HDMI scaler finishes its cold-boot
-# image-lock. splash-fb.service / the app re-assert the same image later.
+# initramfs-tools init-top SCRIPT: paint the boot splash to /dev/fb0 as early
+# as possible — init-top runs before the initramfs udev step (~1-1.5s), and the
+# fb needs only devtmpfs + the built-in fb driver (plus the mknod fallback
+# below), so this shaves that wait vs the old init-premount placement. A single
+# paint — the framebuffer content persists (no modeset; fbcon is detached) and
+# is shown the instant the HDMI scaler finishes its cold-boot image-lock.
+# splash-fb.service / the app re-assert the same image later.
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case "$1" in
