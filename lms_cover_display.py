@@ -56,7 +56,7 @@ DEFAULTS = {
     "cli_user": "",          # CLI login user (blank = no auth, the common case)
     "cli_pass": "",          # CLI login password
     "event_heartbeat": "30.0",  # safety re-sweep interval while the socket is up
-    "cover_px": "1000",      # requested cover size from LMS (server-side resize)
+    "cover_px": "1200",      # requested cover size from LMS (server-side resize)
     "idle_blank_seconds": "300",   # hold last cover this long after stop, then blank
     "text_show_seconds": "8",      # show artist/title this long after a track change (0 = always)
     "text_fade_seconds": "0.6",    # fade-out duration for the artist/title overlay
@@ -404,11 +404,13 @@ def _art_url(cfg: Config, track: dict):
     We never fetch remote art directly: a bare /imageproxy/<enc>/image.png
     301-redirects to the remote (often https), and this Pi has no RTC — at
     boot the clock is stale until NTP, so the CDN's TLS cert reads "not
-    yet valid" and the cover fails. Adding a size spec (image_NxN_o.jpg)
+    yet valid" and the cover fails. Adding a size spec (image_NxN_o.png)
     makes LMS fetch + resize server-side and return the bytes itself, so
-    the Pi only ever does plain LAN HTTP to LMS, clock-independent. The .jpg
-    spec (covers have no alpha) is ~6x smaller than the .png form and much
-    faster to decode on the Pi."""
+    the Pi only ever does plain LAN HTTP to LMS, clock-independent. The .png
+    spec is lossless (a .jpg spec would re-encode ~37dB, second-generation
+    loss); its slower decode is hidden by the next-track prefetch. Note the
+    _o spec never upscales: LMS returns min(requested, native) size, and the
+    renderer smoothscales the rest — one resample, best quality."""
     coverid = track.get("coverid")
     artwork_url = track.get("artwork_url")
     px = cfg.cover_px
@@ -419,17 +421,17 @@ def _art_url(cfg: Config, track: dict):
         if artwork_url.startswith("http"):
             # External absolute URL: route through the LMS imageproxy.
             return key, (f"{cfg.base_url}/imageproxy/"
-                         f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.jpg")
+                         f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
         rel = artwork_url.lstrip("/")
         if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
-            rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.jpg"
+            rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
         return key, f"{cfg.base_url}/{rel}"
     if coverid:
         # The _o suffix = keep the artwork's native aspect, max dimension px,
         # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
         # blur-fill ourselves, so we want the original aspect ratio.
         return (f"cid:{coverid}",
-                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.jpg")
+                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.png")
     return "", ""
 
 
@@ -462,7 +464,7 @@ class NowPlaying:
             pid = status.get("playerid", "")
             np.cover_key = "current"
             np.cover_url = (
-                f"{cfg.base_url}/music/current/cover_{px}x{px}_o.jpg?player={quote(pid)}"
+                f"{cfg.base_url}/music/current/cover_{px}x{px}_o.png?player={quote(pid)}"
             )
         # The sweep asks for two playlist entries; entry [1] is the upcoming
         # track, whose art we prefetch so the swap at the song change is
@@ -661,7 +663,7 @@ class Display:
         # Normalise to a plain 32-bit surface by blitting onto a fresh one.
         # (Surface.convert() needs a display surface, which we don't have in
         # framebuffer mode.) We fetch the artwork at its native aspect ratio
-        # (cover_NxN_o.jpg), so it is shown whole, scaled to fit a 1:1 square zone;
+        # (cover_NxN_o.png), so it is shown whole, scaled to fit a 1:1 square zone;
         # the blurred/saturated backdrop (see _background) shows through any margin.
         surf = pygame.Surface(img.get_size())
         surf.blit(img, (0, 0))
