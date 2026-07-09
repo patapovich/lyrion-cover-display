@@ -391,15 +391,25 @@ class EventListener:
 # Now-playing model
 # --------------------------------------------------------------------------- #
 
+# Spotify CDN image-id size prefixes: the first 16 hex chars of an i.scdn.co
+# image id select a size class of the SAME image. Spotty's high-res option
+# emits the 2000px class; swapping the prefix yields the fast 640px variant.
+_SCDN_HIRES = "ab67616d000082c1"   # 2000px ("original") class
+_SCDN_FAST = "ab67616d0000b273"    # 640px class
+
+
 def _art_url(cfg: Config, track: dict):
-    """(cover_key, cover_url) for a status playlist_loop entry, or ("", "")
-    when the track carries no usable art identity.
+    """(cover_key, cover_url, hires_url) for a status playlist_loop entry, or
+    ("", "", "") when the track carries no usable art identity. hires_url is
+    non-empty only for Spotify 2000px-class art (see _SCDN_HIRES): cover_url
+    is then the fast 640px variant to paint immediately, and hires_url the
+    slow full-quality fetch to upgrade to (prefetch grabs hires directly).
 
     Prefer artwork_url when present. Remote sources (internet radio, some
     streams) set a synthetic/negative coverid that does NOT resolve via
     /music/<id>/cover, but DO provide a real artwork_url (often an
-    /imageproxy/... link). Local tracks and Spotify albums have no
-    artwork_url, so they fall to coverid.
+    /imageproxy/... link). Local tracks have no artwork_url, so they fall
+    to coverid.
 
     We never fetch remote art directly: a bare /imageproxy/<enc>/image.png
     301-redirects to the remote (often https), and this Pi has no RTC — at
@@ -415,24 +425,31 @@ def _art_url(cfg: Config, track: dict):
     artwork_url = track.get("artwork_url")
     px = cfg.cover_px
     if artwork_url:
-        key = f"url:{artwork_url}"
+        # Normalise the key across size classes so 82c1/b273 emissions of the
+        # same image share one cache identity (fork toggles, stale metadata).
+        key = f"url:{artwork_url.replace(_SCDN_HIRES, _SCDN_FAST, 1)}"
         if artwork_url.startswith(cfg.base_url):
             artwork_url = artwork_url[len(cfg.base_url):]  # absolute-to-LMS
         if artwork_url.startswith("http"):
             # External absolute URL: route through the LMS imageproxy.
-            return key, (f"{cfg.base_url}/imageproxy/"
-                         f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
-        rel = artwork_url.lstrip("/")
-        if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
-            rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
-        return key, f"{cfg.base_url}/{rel}"
+            url = (f"{cfg.base_url}/imageproxy/"
+                   f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
+        else:
+            rel = artwork_url.lstrip("/")
+            if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
+                rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
+            url = f"{cfg.base_url}/{rel}"
+        if _SCDN_HIRES in url:
+            return key, url.replace(_SCDN_HIRES, _SCDN_FAST, 1), url
+        return key, url, ""
     if coverid:
         # The _o suffix = keep the artwork's native aspect, max dimension px,
         # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
         # blur-fill ourselves, so we want the original aspect ratio.
         return (f"cid:{coverid}",
-                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.png")
-    return "", ""
+                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.png",
+                "")
+    return "", "", ""
 
 
 @dataclass
@@ -443,8 +460,10 @@ class NowPlaying:
     album: str = ""
     cover_key: str = ""          # identity used to detect art changes
     cover_url: str = ""          # absolute URL to fetch the cover from
+    cover_hires_url: str = ""    # slow full-quality variant ("" = cover_url is final)
     next_cover_key: str = ""     # upcoming track's art identity (prefetch)
     next_cover_url: str = ""     # upcoming track's art URL (prefetch)
+    next_cover_hires_url: str = ""
 
     @staticmethod
     def parse(cfg: Config, status: dict) -> "NowPlaying":
@@ -457,9 +476,10 @@ class NowPlaying:
         np.artist = track.get("artist", "") or track.get("albumartist", "")
         np.album = track.get("album", "")
 
-        np.cover_key, np.cover_url = _art_url(cfg, track)
+        np.cover_key, np.cover_url, np.cover_hires_url = _art_url(cfg, track)
         if not np.cover_key:
             # Last resort: the "current cover" shortcut for this player.
+            # cover_hires_url stays "" — this form is final, never upgraded.
             px = cfg.cover_px
             pid = status.get("playerid", "")
             np.cover_key = "current"
@@ -470,7 +490,8 @@ class NowPlaying:
         # track, whose art we prefetch so the swap at the song change is
         # instant. Only real identities are prefetchable (no "current" form).
         if len(loop) > 1:
-            np.next_cover_key, np.next_cover_url = _art_url(cfg, loop[1])
+            (np.next_cover_key, np.next_cover_url,
+             np.next_cover_hires_url) = _art_url(cfg, loop[1])
         return np
 
 
@@ -790,11 +811,12 @@ class Display:
         veil.fill(self._BG_TINT)
         veil.set_alpha(self._BG_TINT_ALPHA)
         bg.blit(veil, (0, 0))
-        # Cap 4: current + prefetched next + slack for the transient double
-        # key-change LMS emits while a track loads (placeholder art first) —
-        # with only 2 slots that churn evicted the prewarmed backdrop and the
-        # swap paid a full recompute (~1s) despite the cover-cache hit.
-        while len(cache) >= 4:
+        # Cap 5: current + prefetched next + the fast->hires upgrade pair on a
+        # cold skip + slack for the transient double key-change LMS emits
+        # while a track loads (placeholder art first) — too few slots churn
+        # out the prewarmed backdrop and the swap pays a full recompute (~1s)
+        # despite the cover-cache hit.
+        while len(cache) >= 5:
             cache.pop(next(iter(cache)))
         cache[id(cover)] = (cover, bg)
         return bg
@@ -804,6 +826,14 @@ class Display:
         render at the actual song change is a pure cache hit."""
         if self.cfg.background != "black":
             self._background(cover)
+
+    def drop_background(self, cover):
+        """Evict a superseded cover's cached backdrop (e.g. the fast 640px
+        surface once its hi-res replacement has been painted) — the entry
+        would otherwise pin the dead surface + a full-canvas backdrop."""
+        cache = getattr(self, "_bg_cache", None)
+        if cache:
+            cache.pop(id(cover), None)
 
     def _cover_shadow(self, band_top):
         """A soft drop shadow cast *down* from the cover's bottom edge onto the
@@ -1276,11 +1306,14 @@ def run(cfg: Config):
     last_active = None        # MAC most recently seen playing (sticky idle target)
     prev_selected = None      # to detect a display switch and reset transient state
     cover_surface = None
-    cover_cache = {}          # cover_key -> decoded surface
+    cover_cache = {}          # cover_key -> (decoded surface, final)
+    # `final` False = the fast 640px variant is cached and a hi-res upgrade is
+    # still worthwhile; True = hi-res fetched, or the art has no hi-res form.
     last_key = None
     cover_retry_key = None    # cover_key being re-fetched after a failed attempt
     cover_retry_n = 0         # bounded fast retries for that key (stale-clock etc.)
     prefetch_failed_key = None  # next-cover key that failed; one attempt only
+    hires_pending = None      # cover_key awaiting its hi-res upgrade fetch
     art_t0 = None             # art change detected at this time (for the log line)
     art_src = ""              # "prefetched" (cache hit) or "fetched"
     last_track = None         # (title, artist, album, cover_key) — detects track changes
@@ -1366,6 +1399,7 @@ def run(cfg: Config):
                         last_state_id = None
                         text_until = 0.0
                         prefetch_failed_key = None
+                        hires_pending = None
 
                     np, power = polls[selected]
                     # "Engaged" = audio active (play, or pause kept lit): drives the
@@ -1383,12 +1417,28 @@ def run(cfg: Config):
                         # Fetch cover only when the art identity changes.
                         if np.cover_key and np.cover_key != last_key:
                             art_t0 = time.monotonic()
-                            surf = cover_cache.get(np.cover_key)
-                            art_src = "prefetched" if surf is not None else "fetched"
-                            if surf is None:
+                            hires_pending = None       # previous upgrade is moot
+                            cached = cover_cache.get(np.cover_key)
+                            art_src = "prefetched" if cached is not None else "fetched"
+                            if cached is not None:
+                                surf, final = cached
+                            else:
+                                # Fast variant first (~0.5s) so the panel
+                                # updates immediately; the hi-res upgrade step
+                                # below sharpens it afterwards.
                                 surf = _fetch_cover(client, display, np.cover_url)
+                                final = not np.cover_hires_url
+                                if (surf is None and np.cover_hires_url
+                                        and np.cover_key != cover_retry_key):
+                                    # First failure for this key only (the
+                                    # bounded retry below re-enters here every
+                                    # ~3s — one slow fallback, not twenty):
+                                    # rare hash with no 640 variant.
+                                    surf = _fetch_cover(client, display,
+                                                        np.cover_hires_url)
+                                    final = True
                                 if surf is not None:
-                                    cover_cache[np.cover_key] = surf
+                                    cover_cache[np.cover_key] = (surf, final)
                                     _trim_cache(cover_cache)
                             # Adopt the new art; if the fetch failed, drop to
                             # no-cover for this key so we show the status screen
@@ -1398,6 +1448,8 @@ def run(cfg: Config):
                                 # Success: stop re-fetching this key.
                                 last_key = np.cover_key
                                 cover_retry_key = None
+                                if not final and np.cover_hires_url:
+                                    hires_pending = np.cover_key
                             else:
                                 # Fetch failed — e.g. a stale boot clock (no RTC +
                                 # ro overlay can't persist fake-hwclock) makes the
@@ -1435,6 +1487,11 @@ def run(cfg: Config):
                              else S_UNREACHABLE)
                     playing = False
                     status_msg = _STATUS_TEXT[state]
+                    # (hires_pending deliberately survives a poll failure: the
+                    # upgrade step's `state in _ENGAGED` gate already blocks
+                    # fetches until a sweep succeeds, and keeping it armed lets
+                    # the upgrade fire after a one-blip recovery instead of
+                    # losing hi-res for the rest of the track.)
                     # Back off the retry sweep (events can't be trusted while the
                     # HTTP side is failing); don't re-sweep faster than ~2s.
                     heartbeat_at = now + max(2.0, cfg.poll_interval)
@@ -1540,19 +1597,81 @@ def run(cfg: Config):
                 print(f"[error] render/power step failed: {exc}", flush=True)
                 last_state_id = None      # force a clean redraw next iteration
 
-            # --- prefetch the upcoming track's cover + backdrop ------------- #
-            # The sweep already carries the next playlist entry; pulling its
-            # art now (once, guarded by the cache) makes the swap at the song
-            # change a pure cache hit — no network/decode in the critical
-            # path. Blocking is fine here: events queue in the socket buffer
-            # and are drained on the next loop.
-            if (playing and np.next_cover_key
+            # --- heavy fetches: hi-res upgrade first, else next-track prefetch #
+            # At most ONE blocking fetch per iteration so the loop never sits
+            # out two timeouts back-to-back; events queue in the socket buffer
+            # meanwhile and are drained on the next pass.
+            upgrade_fired = False
+
+            # (a) Upgrade the painted fast cover to its hi-res variant. Skip
+            # (pending stays armed) while events are queued — a rapid skip
+            # burst must stay responsive, and its later tracks make this
+            # upgrade moot anyway. Gate on the freshly classified state, not
+            # the sweep-local `engaged` (stale after a poll exception).
+            events_queued = False
+            if listener.connected:
+                try:
+                    events_queued = bool(
+                        select.select([listener.fileno()], [], [], 0)[0])
+                except (OSError, ValueError):
+                    pass
+            if (hires_pending and hires_pending == np.cover_key == last_key
+                    and np.cover_hires_url and state in _ENGAGED
+                    and not events_queued):
+                # (np.cover_hires_url can be "" for the SAME key when the
+                # server re-emits the b273 form — the key is normalized
+                # across size classes; keep pending armed for a later 82c1.)
+                t0 = time.monotonic()
+                surf = _fetch_cover(client, display, np.cover_hires_url)
+                upgrade_fired = True
+                if surf is not None:
+                    try:
+                        old = cover_surface
+                        display.prewarm_background(surf)
+                        cover_cache[np.cover_key] = (surf, True)
+                        cover_surface = surf
+                        if old is not None:
+                            display.drop_background(old)
+                        # Repaint NOW — nothing else wakes the loop for up to
+                        # event_heartbeat (30s) mid-track.
+                        alpha = _text_alpha(time.monotonic(), text_until,
+                                            show_secs, fade)
+                        display.render(cover_surface, np, alpha)
+                        last_state_id = None   # next pass re-derives identity
+                        print(f"art hires upgrade painted in "
+                              f"{(time.monotonic() - t0) * 1000:.0f}ms",
+                              flush=True)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[warn] hires upgrade render failed: {exc}",
+                              flush=True)
+                        # cover_surface already holds the hi-res frame; force
+                        # the render section to repaint it cleanly next pass
+                        # (state_id can't tell fast/hires surfaces apart).
+                        last_state_id = None
+                    hires_pending = None
+                else:
+                    # Transient failure: keep the fast art, disarm for this
+                    # play-through. The cache entry stays (surf, False), so a
+                    # later cache hit (album replay) re-arms the upgrade.
+                    hires_pending = None
+
+            # (b) Prefetch the upcoming track's cover + backdrop. Hi-res
+            # directly — its cost is invisible here — falling back to the
+            # fast variant so a hi-res hiccup still yields instant swaps.
+            elif (playing and np.next_cover_key
                     and np.next_cover_key != np.cover_key
                     and np.next_cover_key not in cover_cache
                     and np.next_cover_key != prefetch_failed_key):
-                surf = _fetch_cover(client, display, np.next_cover_url)
+                surf = None
+                final = True
+                if np.next_cover_hires_url:
+                    surf = _fetch_cover(client, display,
+                                        np.next_cover_hires_url)
+                if surf is None:
+                    surf = _fetch_cover(client, display, np.next_cover_url)
+                    final = not np.next_cover_hires_url
                 if surf is not None:
-                    cover_cache[np.next_cover_key] = surf
+                    cover_cache[np.next_cover_key] = (surf, final)
                     _trim_cache(cover_cache)
                     try:
                         display.prewarm_background(surf)
@@ -1563,6 +1682,12 @@ def run(cfg: Config):
                     # One attempt per key: the normal change-path (with its
                     # bounded retry) covers it if this track actually plays.
                     prefetch_failed_key = np.next_cover_key
+
+            if upgrade_fired:
+                # The upgrade consumed this pass's fetch budget; wake shortly
+                # so a still-needed prefetch isn't parked until the heartbeat
+                # (short tracks would otherwise never prefetch).
+                heartbeat_at = min(heartbeat_at, time.monotonic() + 0.5)
 
             # --- wait for a pushed event, or until the next required deadline ---
             now = time.monotonic()
@@ -1608,6 +1733,9 @@ def _fetch_cover(client: LMSClient, display: Display, url: str):
 
 
 def _trim_cache(cache: dict, limit: int = 6):
+    # FIFO by INSERTION: re-storing an existing key (the hi-res upgrade does
+    # this) keeps its original position, so upgraded entries age from their
+    # first insert — intentional; do not assume re-store refreshes recency.
     while len(cache) > limit:
         cache.pop(next(iter(cache)))
 
