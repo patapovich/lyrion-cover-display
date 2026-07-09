@@ -392,18 +392,27 @@ class EventListener:
 # --------------------------------------------------------------------------- #
 
 # Spotify CDN image-id size prefixes: the first 16 hex chars of an i.scdn.co
-# image id select a size class of the SAME image. Spotty's high-res option
-# emits the 2000px class; swapping the prefix yields the fast 640px variant.
+# image id select a size class of the SAME image. Stock Spotty emits the
+# 640px class; swapping the prefix yields the 2000px ("original") variant —
+# derived HERE, client-side, so the LMS UI/mosaics never pay the big fetches
+# (a server-side hi-res plugin fork proved too slow for everything else).
+# Anchored to i.scdn.co album-art ids inside the percent-encoded imageproxy
+# URL, mirroring that fork's own anchoring — playlist mosaics, artist and
+# show images are never touched.
 _SCDN_HIRES = "ab67616d000082c1"   # 2000px ("original") class
 _SCDN_FAST = "ab67616d0000b273"    # 640px class
+_SCDN_MARK_HI = "i.scdn.co%2Fimage%2F" + _SCDN_HIRES
+_SCDN_MARK_LO = "i.scdn.co%2Fimage%2F" + _SCDN_FAST
 
 
 def _art_url(cfg: Config, track: dict):
     """(cover_key, cover_url, hires_url) for a status playlist_loop entry, or
     ("", "", "") when the track carries no usable art identity. hires_url is
-    non-empty only for Spotify 2000px-class art (see _SCDN_HIRES): cover_url
-    is then the fast 640px variant to paint immediately, and hires_url the
-    slow full-quality fetch to upgrade to (prefetch grabs hires directly).
+    non-empty only for Spotify album art: cover_url is the fast 640px variant
+    to paint immediately, and hires_url the slow 2000px fetch to upgrade to
+    (prefetch grabs hires directly). Both emission directions are handled —
+    stock Spotty's 640 ids get the hi-res variant derived by prefix swap,
+    and hi-res-fork 2000px ids get the fast variant derived the same way.
 
     Prefer artwork_url when present. Remote sources (internet radio, some
     streams) set a synthetic/negative coverid that does NOT resolve via
@@ -439,8 +448,10 @@ def _art_url(cfg: Config, track: dict):
             if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
                 rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
             url = f"{cfg.base_url}/{rel}"
-        if _SCDN_HIRES in url:
+        if _SCDN_MARK_HI in url:
             return key, url.replace(_SCDN_HIRES, _SCDN_FAST, 1), url
+        if _SCDN_MARK_LO in url:
+            return key, url, url.replace(_SCDN_FAST, _SCDN_HIRES, 1)
         return key, url, ""
     if coverid:
         # The _o suffix = keep the artwork's native aspect, max dimension px,
@@ -1732,7 +1743,9 @@ def _fetch_cover(client: LMSClient, display: Display, url: str):
         return None
 
 
-def _trim_cache(cache: dict, limit: int = 6):
+def _trim_cache(cache: dict, limit: int = 5):
+    # 5 × ~5.5MB surfaces (everything is 1200px-class now that hi-res upgrades
+    # replace the 640s) keeps steady-state RSS comfortably under MemoryMax.
     # FIFO by INSERTION: re-storing an existing key (the hi-res upgrade does
     # this) keeps its original position, so upgraded entries age from their
     # first insert — intentional; do not assume re-store refreshes recency.
