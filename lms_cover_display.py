@@ -1791,7 +1791,7 @@ def run(cfg: Config):
                                               np.album.strip()
                                               or np.title.strip())
                     if res[0] == "ok":
-                        radio_stage = ("fetch", res[1], res[2])
+                        radio_stage = ("fetch", res[1])   # candidate list
                         radio_try_n = 0   # fetch gets its own retry budget
                     elif res[0] == "nomatch":
                         # Definitive: the search completed and nothing passed
@@ -1822,7 +1822,8 @@ def run(cfg: Config):
                                                max(radio_next_try,
                                                    radio_backoff_until))
                 else:
-                    _, big_url, source = radio_stage
+                    cands = radio_stage[1]
+                    big_url, source = cands[0]
                     surf = _fetch_cover(client, display,
                                         _radio_proxy_url(cfg, big_url))
                     if surf is not None:
@@ -1844,7 +1845,10 @@ def run(cfg: Config):
                         if (dist is not None
                                 and dist > cfg.radio_cover_match_threshold):
                             # Looks like different artwork than the stream's
-                            # own — reject, but NOT into radio_neg: on a
+                            # own — reject this candidate and move to the
+                            # next source's variant (a different edition /
+                            # scan may match; one fetch per pass, unpark
+                            # chains them). NOT put into radio_neg: on a
                             # logo station's very first song the "reference"
                             # is the not-yet-identified logo itself, and a
                             # permanent reject would poison a correct cover.
@@ -1852,10 +1856,15 @@ def run(cfg: Config):
                             # seen with other idents -> sentinel -> the gate
                             # skips it and the cover goes through. Genuinely
                             # wrong art just gets re-rejected per replay.
-                            radio_stage = None
+                            cands.pop(0)
+                            radio_stage = ("fetch", cands) if cands else None
+                            radio_try_n = 0   # fresh budget per candidate
                             print(f"radio: cover rejected, dhash {dist}/64 "
                                   f"> {cfg.radio_cover_match_threshold} "
-                                  f"({source})", flush=True)
+                                  f"({source}"
+                                  + (f"; trying {cands[0][1]}" if cands
+                                     else "; no more candidates") + ")",
+                                  flush=True)
                         else:
                             try:
                                 display.prewarm_background(surf)
@@ -1881,12 +1890,19 @@ def run(cfg: Config):
                             radio_stage = None
                     else:
                         # Imageproxy/decode failure: keep the search result,
-                        # retry just the fetch on the same pacing.
+                        # retry just the fetch on the same pacing; after the
+                        # budget, fall through to the next candidate (a
+                        # different CDN may serve fine).
                         radio_try_n += 1
                         radio_backoff_until = now + 20.0
                         if radio_try_n >= 3:
-                            radio_stage = None
-                            print("radio: cover fetch gave up", flush=True)
+                            cands.pop(0)
+                            radio_stage = ("fetch", cands) if cands else None
+                            radio_try_n = 0
+                            print("radio: cover fetch gave up on "
+                                  f"{source}"
+                                  + (f"; trying {cands[0][1]}" if cands
+                                     else "") , flush=True)
                         else:
                             radio_next_try = now + 10.0 * radio_try_n
                             heartbeat_at = min(heartbeat_at,
@@ -2027,7 +2043,8 @@ def _radio_ident(cfg: Config, np: "NowPlaying"):
 
 def _radio_cover_search(cfg: Config, artist: str, album: str):
     """Query the cover aggregator for artist+album. Returns
-    ("ok", big_url, source) for the best EXACT match,
+    ("ok", [(big_url, source), ...]) EXACT matches, preference order, max 3
+                            (one per source — fallbacks for the dHash gate),
     ("nomatch",)            when the search completed without one (definitive),
     ("error", reason)       on any transport/gate problem (transient).
 
@@ -2097,9 +2114,10 @@ def _radio_cover_search(cfg: Config, artist: str, album: str):
                     break
     except Exception as exc:  # noqa: BLE001  (URLError, SSL, timeout, HTTP…)
         return ("error", str(exc))
-    for src in cfg.radio_cover_sources:
-        if src in covers and accuracy.get(src) == "exact":
-            return ("ok", covers[src], src)
+    cands = [(covers[src], src) for src in cfg.radio_cover_sources
+             if src in covers and accuracy.get(src) == "exact"][:3]
+    if cands:
+        return ("ok", cands)
     if complete:
         return ("nomatch",)
     if not done and not accuracy:
