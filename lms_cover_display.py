@@ -2202,6 +2202,21 @@ def _radio_norm(s: str) -> str:
 
 
 _TIER3_DELIMS = ("(", "[", "-", "–", ":")
+# Multi-artist credit separators ("Alok, Zeeba & Portugal. The Man"). " and "
+# is deliberately absent — it is part of too many band names.
+_CREDIT_SEPS = (",", ";", "&", " feat.", " feat ", " featuring ", " ft.",
+                " ft ", " with ", " w/ ", " x ", " × ")
+
+
+def _credit_segments(artist_raw: str):
+    """Normalized set of individual artists in a (possibly multi-artist)
+    credit string: "Alok, Zeeba & Portugal. The Man" ->
+    {"alok", "zeeba", "portugal the man"}. Split BEFORE normalizing —
+    _radio_norm strips the commas the split needs."""
+    s = artist_raw.casefold()
+    for sep in _CREDIT_SEPS:
+        s = s.replace(sep, "|")
+    return {seg for seg in (_radio_norm(p) for p in s.split("|")) if seg}
 
 
 def _radio_tier(artist_q: str, album_q: str, artist_r: str, title_r: str):
@@ -2227,16 +2242,29 @@ def _radio_tier(artist_q: str, album_q: str, artist_r: str, title_r: str):
     artist_ok = (na_q == na_r
                  or (na_r.startswith(na_q)
                      and na_r[len(na_q):].lstrip().startswith("(")))
-    if not artist_ok:
+    # Multi-artist credits: radio tags the primary artist while stores credit
+    # everyone ("Portugal. The Man" vs "Alok, Zeeba & Portugal. The Man") —
+    # match when either side is a complete segment of the other's credit
+    # list. Loose by nature -> tier-3 class (only shown after dHash).
+    artist_credit = (not artist_ok
+                     and (na_q in _credit_segments(artist_r)
+                          or na_r in _credit_segments(artist_q)))
+    if not artist_ok and not artist_credit:
         return 0
-    if nt_q == nt_r:
-        return 2
-    for longer, shorter in ((nt_r, nt_q), (nt_q, nt_r)):
-        if longer.startswith(shorter):
-            rest = longer[len(shorter):].lstrip()
-            if rest and rest.startswith(_TIER3_DELIMS):
-                return 3
-    return 0
+    title_eq = nt_q == nt_r
+    title_dec = False
+    if not title_eq:
+        for longer, shorter in ((nt_r, nt_q), (nt_q, nt_r)):
+            if longer.startswith(shorter):
+                rest = longer[len(shorter):].lstrip()
+                if rest and rest.startswith(_TIER3_DELIMS):
+                    title_dec = True
+                    break
+    if not title_eq and not title_dec:
+        return 0
+    if artist_credit:
+        return 3
+    return 2 if title_eq else 3
 
 
 def _radio_cover_search(cfg: Config, artist: str, album: str):
