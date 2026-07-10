@@ -82,10 +82,16 @@ DEFAULTS = {
     # station's own per-song art (when it has any) before being adopted.
     "radio_cover_search": "true",
     "radio_cover_country": "de",   # store country for the search (NOTE: "fi" is rejected upstream)
-    "radio_cover_sources": "applemusic, tidal, spotify, amazonmusic, bugs",  # preference order
+    # Preference order = artwork QUALITY, not just resolution: everything is
+    # resized to cover_px by the LMS imageproxy anyway, so the order decides
+    # which ORIGINAL feeds that resize. Apple serves the cleanest originals,
+    # Tidal hosts the label's own upload (origin.jpg), Amazon full-size
+    # scans, Spotify re-encodes its 2000px class, bugs is variable.
+    "radio_cover_sources": "applemusic, tidal, amazonmusic, spotify, bugs",
     "radio_cover_title_fallback": "false",  # true = when the stream has no album tag, search the song title as an album name (usually finds the single)
     "radio_cover_timeout": "8.0",  # wall-clock deadline for one search (seconds)
     "radio_cover_match_threshold": "16",  # max dHash distance (0-64) vs station art; higher = laxer
+    "radio_cover_loose_match": "true",  # also accept punctuation variants + decorated editions (Deluxe/Single/Remastered…) — ONLY when the station's own per-song art visually confirms them
     "upgrade_fade_seconds": "0.4",  # crossfade when a sharper cover replaces art already on screen (hi-res upgrade, radio cover); 0 = hard cut
 }
 
@@ -124,6 +130,7 @@ class Config:
     radio_cover_title_fallback: bool
     radio_cover_timeout: float
     radio_cover_match_threshold: int
+    radio_cover_loose_match: bool
     upgrade_fade_seconds: float
 
     @property
@@ -207,6 +214,7 @@ def load_config(path: str | None) -> Config:
             radio_cover_timeout=max(1.0, s.getfloat("radio_cover_timeout")),
             radio_cover_match_threshold=max(
                 0, min(64, s.getint("radio_cover_match_threshold"))),
+            radio_cover_loose_match=s.getboolean("radio_cover_loose_match"),
             upgrade_fade_seconds=max(
                 0.0, min(2.0, s.getfloat("upgrade_fade_seconds"))),
         )
@@ -1857,21 +1865,58 @@ def run(cfg: Config):
                                                max(radio_next_try,
                                                    radio_backoff_until))
                 else:
+                    # Visual verification: when the station provides
+                    # per-song art (its key has never been seen with a
+                    # different song), the found cover must perceptually
+                    # match it. Station logos (key repeats across songs)
+                    # and art-less stations skip the gate — and there ONLY
+                    # tier-1 (strict text equality) candidates may show:
+                    # the looser tiers exist strictly under dHash cover.
+                    ref_ok = (cover_surface is not None
+                              and np.cover_key not in ("", "current")
+                              and radio_key_idents.get(np.cover_key)
+                              == radio_ident)
                     cands = radio_stage[1]
-                    big_url, source = cands[0]
-                    surf = _fetch_cover(client, display,
-                                        _radio_proxy_url(cfg, big_url))
-                    if surf is not None:
-                        # Visual verification: when the station provides
-                        # per-song art (its key has never been seen with a
-                        # different song), the found cover must perceptually
-                        # match it. Station logos (key repeats across songs)
-                        # and art-less stations skip the gate — text-exact
-                        # match stands alone there.
-                        ref_ok = (cover_surface is not None
-                                  and np.cover_key not in ("", "current")
-                                  and radio_key_idents.get(np.cover_key)
-                                  == radio_ident)
+                    # Head = first candidate usable RIGHT NOW. The filter is
+                    # deliberately non-destructive: ref_ok can be False just
+                    # because the station art is mid-retry, and the loose
+                    # candidates must still be there when it lands.
+                    head = next((i for i, c in enumerate(cands)
+                                 if ref_ok or c[2] == 1), None)
+                    surf = None
+                    if head is not None:
+                        big_url, source, tier = cands[head]
+                        surf = _fetch_cover(client, display,
+                                            _radio_proxy_url(cfg, big_url))
+                    if head is None:
+                        # Only loose candidates and no visual reference.
+                        if (cover_surface is None
+                                and np.cover_key not in ("", "current")
+                                and radio_key_idents.get(np.cover_key)
+                                == radio_ident):
+                            # Transient: this song HAS its own art but the
+                            # fetch is still retrying — check again shortly.
+                            radio_try_n += 1
+                            if radio_try_n >= 3:
+                                radio_stage = None   # this occurrence only
+                            else:
+                                radio_next_try = now + 10.0 * radio_try_n
+                                heartbeat_at = min(heartbeat_at,
+                                                   radio_next_try)
+                        else:
+                            # Definitive for this song: logo/art-less
+                            # station -> loose tiers unusable by design.
+                            # Negative-cache like a nomatch, else every
+                            # replay (or A<->B metadata flip, which turns
+                            # the art key into the LOGO sentinel) would
+                            # re-search the aggregator per occurrence.
+                            radio_neg[radio_ident] = True
+                            _trim_cache(radio_neg, 64)
+                            radio_stage = None
+                            print("radio: only loose matches and no "
+                                  "per-song art to verify against — "
+                                  "skipped", flush=True)
+                    elif surf is not None:
                         dist = None
                         if ref_ok:
                             dist = _hamming(_dhash(display.pygame, surf),
@@ -1891,12 +1936,12 @@ def run(cfg: Config):
                             # seen with other idents -> sentinel -> the gate
                             # skips it and the cover goes through. Genuinely
                             # wrong art just gets re-rejected per replay.
-                            cands.pop(0)
+                            cands.pop(head)
                             radio_stage = ("fetch", cands) if cands else None
                             radio_try_n = 0   # fresh budget per candidate
                             print(f"radio: cover rejected, dhash {dist}/64 "
                                   f"> {cfg.radio_cover_match_threshold} "
-                                  f"({source}"
+                                  f"({source} tier {tier}"
                                   + (f"; trying {cands[0][1]}" if cands
                                      else "; no more candidates") + ")",
                                   flush=True)
@@ -1915,7 +1960,7 @@ def run(cfg: Config):
                                 last_state_id = None
                                 print(f"radio cover painted in "
                                       f"{(time.monotonic() - t0) * 1000:.0f}"
-                                      f"ms ({source}"
+                                      f"ms ({source} tier {tier}"
                                       + (f", dhash {dist}/64" if dist
                                          is not None else "") + ")",
                                       flush=True)
@@ -1932,7 +1977,7 @@ def run(cfg: Config):
                         radio_try_n += 1
                         radio_backoff_until = now + 20.0
                         if radio_try_n >= 3:
-                            cands.pop(0)
+                            cands.pop(head)
                             radio_stage = ("fetch", cands) if cands else None
                             radio_try_n = 0
                             print("radio: cover fetch gave up on "
@@ -2077,28 +2122,77 @@ def _radio_ident(cfg: Config, np: "NowPlaying"):
     return (np.artist.strip().casefold(), albumish.casefold())
 
 
+def _radio_norm(s: str) -> str:
+    """Punctuation-insensitive form for tier-2/3 title comparison: casefold,
+    drop apostrophes/quotes and sentence punctuation, collapse whitespace.
+    Hyphens/parens/brackets are KEPT (they delimit tier-3 decorations), and
+    so are diacritics (ä is not a in Finnish)."""
+    s = s.casefold()
+    for ch in "'\"’‘“”!?.,":
+        s = s.replace(ch, "")
+    return " ".join(s.split())
+
+
+_TIER3_DELIMS = ("(", "[", "-", "–", ":")
+
+
+def _radio_tier(artist_q: str, album_q: str, artist_r: str, title_r: str):
+    """Match tier of one search result against the query: 1 = exact
+    (casefold equality, the original strict rule), 2 = punctuation-
+    insensitive equality, 3 = decorated variant of the same release
+    ("Album (Deluxe)", "Album - Single", store artist "Artist(아티스트)",
+    or the reverse — stream album decorated, store title plain). 0 = no
+    match. Tiers 2/3 are only ever shown after the dHash visual gate."""
+    a_q, t_q = artist_q.strip().casefold(), album_q.strip().casefold()
+    a_r, t_r = (artist_r or "").strip().casefold(), (title_r or "").strip().casefold()
+    if not a_r or not t_r:
+        return 0
+    if a_q == a_r and t_q == t_r:
+        return 1
+    na_q, nt_q = _radio_norm(artist_q), _radio_norm(album_q)
+    na_r, nt_r = _radio_norm(artist_r), _radio_norm(title_r)
+    if not (na_q and nt_q and na_r and nt_r):
+        # Punctuation-only names ("?", "!!!") normalize to "" and would make
+        # every startswith below vacuously true. Their legitimate matches are
+        # literal and already returned tier 1 above.
+        return 0
+    artist_ok = (na_q == na_r
+                 or (na_r.startswith(na_q)
+                     and na_r[len(na_q):].lstrip().startswith("(")))
+    if not artist_ok:
+        return 0
+    if nt_q == nt_r:
+        return 2
+    for longer, shorter in ((nt_r, nt_q), (nt_q, nt_r)):
+        if longer.startswith(shorter):
+            rest = longer[len(shorter):].lstrip()
+            if rest and rest.startswith(_TIER3_DELIMS):
+                return 3
+    return 0
+
+
 def _radio_cover_search(cfg: Config, artist: str, album: str):
     """Query the cover aggregator for artist+album. Returns
-    ("ok", [(big_url, source), ...]) EXACT matches, preference order, max 3
-                            (one per source — fallbacks for the dHash gate),
-    ("nomatch",)            when the search completed without one (definitive),
-    ("error", reason)       on any transport/gate problem (transient).
+    ("ok", [(big_url, source, tier), ...])  matches, best first, max 5,
+    ("nomatch",)   when the search completed without one (definitive),
+    ("error", reason)  on any transport/gate problem (transient).
 
-    Exact = the source itself reports accuracy "exact" AND the release's
-    artist/title equal the query (casefolded) — sources decorate names
-    (e.g. "Artist(아티스트)") even on exact hits. Video "covers" (Apple
-    motion art, .mp4) are skipped. Source preference = config order."""
+    Sources return relevance-ranked result lists that include entirely
+    unrelated releases, so every result is tiered client-side against the
+    query (see _radio_tier) — the API's count "accuracy" field describes
+    the RESULT-COUNT precision, not match quality, and is ignored. Order:
+    tier, then config source preference, then the source's own ranking.
+    Video "covers" (Apple motion art, .mp4) are skipped."""
     body = json.dumps({"artist": artist, "album": album,
                        "country": cfg.radio_cover_country,
                        "sources": cfg.radio_cover_sources}).encode()
     req = urllib.request.Request(_RADIO_SEARCH_URL, data=body,
                                  headers=_RADIO_HEADERS)
     deadline = time.monotonic() + cfg.radio_cover_timeout
-    accuracy = {}     # source -> accuracy string from its count event
-    covers = {}       # source -> first acceptable bigCoverUrl
+    results = {}      # source -> [(url, tier), ...] in the source's own order
     done = set()
+    saw_events = False
     complete = False  # stream ended on the server's terms (EOF / all done)
-    a_cf, t_cf = artist.strip().casefold(), album.strip().casefold()
     try:
         with urllib.request.urlopen(req, timeout=cfg.radio_cover_timeout) as r:
             seen = 0
@@ -2128,35 +2222,43 @@ def _radio_cover_search(cfg: Config, artist: str, album: str):
                     continue
                 src = ev.get("source", "")
                 typ = ev.get("type")
-                if typ == "count":
-                    accuracy[src] = ev.get("accuracy", "")
-                elif typ == "done":
+                if typ in ("count", "done", "cover", "source"):
+                    saw_events = True
+                if typ == "done":
                     done.add(src)
-                elif typ == "cover" and src not in covers:
-                    # Collect first — the exact-accuracy filter applies at
-                    # selection time, so a cover event arriving before its
-                    # source's count event isn't silently dropped.
+                elif typ == "cover" and len(results.get(src, ())) < 10:
                     info = ev.get("releaseInfo") or {}
                     url = ev.get("bigCoverUrl") or ""
                     path = url.split("?", 1)[0].lower()
                     if (url.startswith("http")
                             and not path.endswith(_RADIO_VIDEO_EXT)
-                            and "mvod.itunes.apple.com" not in url
-                            and (info.get("artist") or "").strip().casefold() == a_cf
-                            and (info.get("title") or "").strip().casefold() == t_cf):
-                        covers[src] = url
+                            and "mvod.itunes.apple.com" not in url):
+                        tier = _radio_tier(artist, album,
+                                           info.get("artist") or "",
+                                           info.get("title") or "")
+                        if tier and (tier == 1
+                                     or cfg.radio_cover_loose_match):
+                            results.setdefault(src, []).append((url, tier))
                 if all(s in done for s in cfg.radio_cover_sources):
                     complete = True
                     break
     except Exception as exc:  # noqa: BLE001  (URLError, SSL, timeout, HTTP…)
         return ("error", str(exc))
-    cands = [(covers[src], src) for src in cfg.radio_cover_sources
-             if src in covers and accuracy.get(src) == "exact"][:3]
+    # Best first: tier, then config source preference, then the source's own
+    # relevance order; dedup by URL (stores repeat editions).
+    cands, seen_urls = [], set()
+    for tier in (1, 2, 3):
+        for src in cfg.radio_cover_sources:
+            for url, t in results.get(src, ()):
+                if t == tier and url not in seen_urls:
+                    seen_urls.add(url)
+                    cands.append((url, src, tier))
+    cands = cands[:5]
     if cands:
         return ("ok", cands)
     if complete:
         return ("nomatch",)
-    if not done and not accuracy:
+    if not saw_events:
         # Loudly distinguishable: header mimicry may have stopped working.
         return ("error", "no sources answered (API gate change?)")
     return ("error", "search cut short (deadline/cap)")
