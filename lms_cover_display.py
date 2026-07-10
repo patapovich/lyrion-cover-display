@@ -86,6 +86,7 @@ DEFAULTS = {
     "radio_cover_title_fallback": "false",  # true = when the stream has no album tag, search the song title as an album name (usually finds the single)
     "radio_cover_timeout": "8.0",  # wall-clock deadline for one search (seconds)
     "radio_cover_match_threshold": "16",  # max dHash distance (0-64) vs station art; higher = laxer
+    "upgrade_fade_seconds": "0.4",  # crossfade when a sharper cover replaces art already on screen (hi-res upgrade, radio cover); 0 = hard cut
 }
 
 
@@ -123,6 +124,7 @@ class Config:
     radio_cover_title_fallback: bool
     radio_cover_timeout: float
     radio_cover_match_threshold: int
+    upgrade_fade_seconds: float
 
     @property
     def base_url(self) -> str:
@@ -205,6 +207,8 @@ def load_config(path: str | None) -> Config:
             radio_cover_timeout=max(1.0, s.getfloat("radio_cover_timeout")),
             radio_cover_match_threshold=max(
                 0, min(64, s.getint("radio_cover_match_threshold"))),
+            upgrade_fade_seconds=max(
+                0.0, min(2.0, s.getfloat("upgrade_fade_seconds"))),
         )
     except ValueError as exc:
         sys.exit(f"Invalid value in config.ini: {exc}")
@@ -935,6 +939,36 @@ class Display:
 
     def render(self, cover, np: NowPlaying, text_alpha: int = 255):
         self.wake()
+        self._compose(cover, np, text_alpha)
+        self.present()
+
+    def crossfade(self, cover, np: NowPlaying, text_alpha: int = 255,
+                  seconds: float = 0.4):
+        """Blend from whatever is on screen to a freshly composed frame with
+        `cover` — used when a sharper variant replaces art already up (hi-res
+        upgrade, radio cover) so the swap reads as a focus-pull, not a cut.
+        Frame pacing comes from the fb blit itself (~100-150ms/frame on the
+        Pi 3); the loop blocks its caller (the heavy slot) for `seconds`."""
+        if seconds <= 0 or self.blanked:
+            self.render(cover, np, text_alpha)
+            return
+        self.wake()
+        old = self.screen.copy()               # frame currently displayed
+        self._compose(cover, np, text_alpha)
+        new = self.screen.copy()
+        t0 = time.monotonic()
+        for i in range(30):                    # hard cap, belt against stalls
+            k = min(1.0, (time.monotonic() - t0) / seconds)
+            if i == 29:
+                k = 1.0   # cap hit (fast presents): force the final frame
+            new.set_alpha(int(255 * k))
+            self.screen.blit(old, (0, 0))
+            self.screen.blit(new, (0, 0))
+            self.present()
+            if k >= 1.0:
+                break
+
+    def _compose(self, cover, np: NowPlaying, text_alpha: int = 255):
         self._status_key = None      # a cover is up; force status redraw next time
         screen = self.screen
         # Info band starts where the (full-width) cover ends; shared by the
@@ -969,7 +1003,6 @@ class Display:
                 screen.blit(ov, (0, 0))
         if np.mode == "pause":
             self._draw_pause(screen)
-        self.present()
 
     def _draw_pause(self, screen):
         """Overlay a pause indicator on the cover so a paused track is obvious.
@@ -1754,10 +1787,12 @@ def run(cfg: Config):
                         if old is not None:
                             display.drop_background(old)
                         # Repaint NOW — nothing else wakes the loop for up to
-                        # event_heartbeat (30s) mid-track.
+                        # event_heartbeat (30s) mid-track. Crossfade: same
+                        # art, sharper — reads as a focus-pull, not a cut.
                         alpha = _text_alpha(time.monotonic(), text_until,
                                             show_secs, fade)
-                        display.render(cover_surface, np, alpha)
+                        display.crossfade(cover_surface, np, alpha,
+                                          cfg.upgrade_fade_seconds)
                         last_state_id = None   # next pass re-derives identity
                         print(f"art hires upgrade painted in "
                               f"{(time.monotonic() - t0) * 1000:.0f}ms",
@@ -1875,7 +1910,8 @@ def run(cfg: Config):
                                 alpha = _text_alpha(time.monotonic(),
                                                     text_until, show_secs,
                                                     fade)
-                                display.render(radio_surface, np, alpha)
+                                display.crossfade(radio_surface, np, alpha,
+                                                  cfg.upgrade_fade_seconds)
                                 last_state_id = None
                                 print(f"radio cover painted in "
                                       f"{(time.monotonic() - t0) * 1000:.0f}"
