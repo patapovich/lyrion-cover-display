@@ -722,6 +722,21 @@ class Display:
         self.font_title = self._font_at(self._font_title_path, self._base)
         self.font_sub = self._font_at(self._font_sub_path, int(self._base * 0.7))
         self.font_status = self._font_at(self._font_sub_path, self._base)  # status
+        # Per-line script fallback: DejaVu has no Ethiopic/CJK/etc glyphs
+        # (radio metadata arrives in the artist's own script — observed live:
+        # "ሙላቱ አስታጥቄ" rendered as boxes). GNU FreeSerif covers far more
+        # scripts and ships on the Pi already; a line whose characters the
+        # primary font lacks is rendered wholly with the fallback instead.
+        self._font_fallback = {
+            self._font_title_path:
+                self._resolve_font(
+                    ["/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf"]),
+            self._font_sub_path:
+                self._resolve_font(
+                    ["/usr/share/fonts/truetype/freefont/FreeSerif.ttf"]),
+        }
+        self._ft_probe = {}   # font path -> pygame.freetype.Font (glyph probe)
+        self._glyph_ok = {}   # (font path, char) -> bool
 
     def _resolve_font(self, candidates):
         for path in candidates:
@@ -736,6 +751,42 @@ class Display:
             cached = self.pygame.font.Font(path, size)
             self._font_cache[(path, size)] = cached
         return cached
+
+    def _covers(self, path, text):
+        """True when the font file at `path` has a real glyph for every
+        non-ASCII character of `text`. Uses pygame.freetype: its get_metrics
+        returns None entries for absent glyphs, whereas pygame.font.metrics
+        happily reports the .notdef box as if it were a glyph."""
+        if path is None:
+            return True          # pygame builtin — nothing to probe
+        probe = self._ft_probe.get(path)
+        if probe is None:
+            import pygame.freetype
+            pygame.freetype.init()
+            probe = self._ft_probe[path] = pygame.freetype.Font(path, 16)
+        for ch in {c for c in text if ord(c) > 127}:
+            ok = self._glyph_ok.get((path, ch))
+            if ok is None:
+                try:
+                    m = probe.get_metrics(ch)
+                    ok = bool(m) and m[0] is not None
+                except Exception:  # noqa: BLE001 (freetype hiccup: assume ok)
+                    ok = True
+                self._glyph_ok[(path, ch)] = ok
+            if not ok:
+                return False
+        return True
+
+    def _line_font_path(self, path, text):
+        """Font file for one text line: the primary unless it is missing
+        glyphs AND the fallback actually has them (else keep primary — a
+        box is no worse in a font that also lacks the script)."""
+        if self._covers(path, text):
+            return path
+        fb = self._font_fallback.get(path)
+        if fb and self._covers(fb, text):
+            return fb
+        return path
 
     # -- cover decoding/scaling ------------------------------------------- #
 
@@ -1109,11 +1160,14 @@ class Display:
         # (path, base_size, text, colour) for each line that is present.
         specs = []
         if np.title:
-            specs.append((self._font_title_path, self._base, np.title, (255, 255, 255)))
+            specs.append((self._line_font_path(self._font_title_path, np.title),
+                          self._base, np.title, (255, 255, 255)))
         if np.artist:
-            specs.append((self._font_sub_path, int(self._base * 0.7), np.artist, (210, 210, 210)))
+            specs.append((self._line_font_path(self._font_sub_path, np.artist),
+                          int(self._base * 0.7), np.artist, (210, 210, 210)))
         if self.cfg.show_album and np.album:
-            specs.append((self._font_sub_path, int(self._base * 0.7), np.album, (170, 170, 170)))
+            specs.append((self._line_font_path(self._font_sub_path, np.album),
+                          int(self._base * 0.7), np.album, (170, 170, 170)))
         if not specs:
             return [], 0
 
