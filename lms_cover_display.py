@@ -86,8 +86,9 @@ DEFAULTS = {
     # resized to cover_px by the LMS imageproxy anyway, so the order decides
     # which ORIGINAL feeds that resize. Apple serves the cleanest originals,
     # Tidal hosts the label's own upload (origin.jpg), Amazon full-size
-    # scans, Spotify re-encodes its 2000px class, bugs is variable.
-    "radio_cover_sources": "applemusic, tidal, amazonmusic, spotify, bugs",
+    # scans, Spotify re-encodes its 2000px class. (bugs excluded: variable
+    # quality and its CDN regularly times out through the imageproxy.)
+    "radio_cover_sources": "applemusic, tidal, amazonmusic, spotify",
     "radio_cover_title_fallback": "false",  # true = when the stream has no album tag, search the song title as an album name (usually finds the single)
     "radio_cover_timeout": "8.0",  # wall-clock deadline for one search (seconds)
     "radio_cover_match_threshold": "16",  # max dHash distance (0-64) vs station art; higher = laxer
@@ -1937,6 +1938,19 @@ def run(cfg: Config):
                             # skips it and the cover goes through. Genuinely
                             # wrong art just gets re-rejected per replay.
                             cands.pop(head)
+                            if dist > cfg.radio_cover_match_threshold + 8:
+                                # FAR miss: the stores all carry the same
+                                # artwork family (observed live: five sources
+                                # rejected at an identical distance) — scan
+                                # variants differ by a few bits, not ten, so
+                                # none of the rest can pass. Fetching them
+                                # one by one just grinds for ~2s each.
+                                if cands:
+                                    print(f"radio: dhash {dist}/64 far off "
+                                          f"— skipping {len(cands)} "
+                                          f"remaining candidate(s)",
+                                          flush=True)
+                                cands = []
                             radio_stage = ("fetch", cands) if cands else None
                             radio_try_n = 0   # fresh budget per candidate
                             print(f"radio: cover rejected, dhash {dist}/64 "
