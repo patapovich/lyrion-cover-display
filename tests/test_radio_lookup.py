@@ -29,6 +29,7 @@ class FakeArt:
         self.surface = surface
         self.cache = {}
         self.last_key = None
+        self.skipped = False
 
 
 class FakeDisplay:
@@ -65,14 +66,29 @@ class TestObserve(unittest.TestCase):
 
     def test_surface_loss_forces_station_art_refetch(self):
         # P1 invariant: while our cover owned the screen the station-art
-        # fetch was skipped; when the cover goes away (ident flip with no
-        # cached replacement), art.last_key must reset so the art refires.
+        # fetch was skipped (art.skipped); when the cover goes away (ident
+        # flip, no cached replacement), art.last_key must reset so the
+        # change path — running after observe() in the same sweep —
+        # refetches immediately.
         self.r.covers[("a", "b")] = object()
         art = FakeArt()
         art.last_key = "url:/k1"
+        art.skipped = True
         self.r.observe(self.cfg, np_(), art)          # adopts cover
         self.r.observe(self.cfg, np_(album="Z"), art)  # flip, no cache
         self.assertIsNone(art.last_key)
+        self.assertFalse(art.skipped)
+
+    def test_surface_loss_without_skips_leaves_art_alone(self):
+        # No skips happened (station art is fresh, e.g. the change path
+        # fetched a new track this sweep) -> the invariant must NOT clobber
+        # last_key: the hi-res upgrade guard depends on it.
+        self.r.covers[("a", "b")] = object()
+        art = FakeArt(surface=object())
+        art.last_key = "url:/fresh"
+        self.r.observe(self.cfg, np_(), art)          # adopts cover
+        self.r.observe(self.cfg, np_(album="Z"), art)  # flip, no cache
+        self.assertEqual(art.last_key, "url:/fresh")
 
     def test_ident_change_clears_transients_keeps_knowledge(self):
         self.r.observe(self.cfg, np_(), FakeArt())

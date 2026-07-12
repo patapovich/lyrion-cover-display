@@ -1577,18 +1577,26 @@ def run(cfg: Config):
                             last_track = track
                             text_until = (float("inf") if show_secs <= 0
                                           else now + show_secs + fade)
+                        # --- radio cover lookup: (re)arm on song identity.
+                        # BEFORE the station-art fetch: when the radio cover
+                        # goes away, observe() clears art.last_key so the
+                        # refetch below happens in the SAME sweep — a gap
+                        # here would flash "loading…" over live artwork.
+                        radio.observe(cfg, np, art)
+
                         # Fetch cover only when the art identity changes.
                         if (np.cover_key and np.cover_key != art.last_key
-                                and radio.surface is not None
-                                and _radio_ident(cfg, np) == radio.ident):
-                            # The radio cover owns the screen for this very
-                            # song (render/classify use radio.surface), so
-                            # the station art is dead weight — skip its
-                            # ~1.4s imageproxy fetch per artwork churn.
-                            # observe() clears last_key when the radio cover
-                            # goes away, so the art refetches then.
+                                and radio.surface is not None):
+                            # The radio cover owns the screen for this song
+                            # (observe() just synced the ident; render and
+                            # classify use radio.surface), so the station
+                            # art is dead weight — skip its ~1.4s imageproxy
+                            # fetch per artwork churn. Keep the previous
+                            # surface (never rendered while the cover is up)
+                            # and mark it stale: the invariant in observe()
+                            # forces a refetch once the cover goes away.
                             art.last_key = np.cover_key
-                            art.surface = None
+                            art.skipped = True
                             art.hires_pending = None
                             art.t0 = None
                         elif np.cover_key and np.cover_key != art.last_key:
@@ -1620,6 +1628,7 @@ def run(cfg: Config):
                             # no-cover for this key so we show the status screen
                             # rather than the *previous* track's cover.
                             art.surface = surf
+                            art.skipped = False
                             if surf is not None:
                                 # Success: stop re-fetching this key.
                                 art.last_key = np.cover_key
@@ -1643,8 +1652,6 @@ def run(cfg: Config):
                                                        now + COVER_RETRY)
                                 art.t0 = None   # nothing painted; no timing line
 
-                        # --- radio cover lookup: (re)arm on song identity --- #
-                        radio.observe(cfg, np, art)
                         was_playing = True
                     else:
                         was_playing = False
@@ -1981,6 +1988,10 @@ class _TrackArt:
         self.hires_pending = None      # cover_key awaiting hi-res upgrade
         self.t0 = None                 # art change seen at (for timing log)
         self.src = ""                  # "prefetched" | "fetched"
+        self.skipped = False           # last key change was SKIPPED (radio
+        #                                cover owned the screen): surface is
+        #                                stale for last_key and must refetch
+        #                                once the radio cover goes away
 
 
 # --------------------------------------------------------------------------- #
@@ -2294,13 +2305,17 @@ class _RadioLookup:
                     self.surface = cached
                 elif ident not in self.neg:
                     self.stage = "search"
-            if had_surface and self.surface is None:
-                # While our cover owned the screen, the change path SKIPS
-                # station-art fetches (they'd be dead weight). Now the cover
-                # is gone, so force the station art to (re)fetch — without
-                # this, a mid-song ident flip (jingle metadata) would leave
-                # the panel with no art at all and nothing to refire.
+            if had_surface and self.surface is None and art.skipped:
+                # While our cover owned the screen, the change path SKIPPED
+                # station-art fetches (dead weight) and art.surface went
+                # stale for last_key. The cover is gone now: clear last_key
+                # so the change path — which runs AFTER observe() in the
+                # same sweep — refetches immediately (no artless gap, no
+                # "loading…" flash). Gated on art.skipped: a transition the
+                # change path will fetch anyway (radio -> local/Spotify, new
+                # key) must not get its fresh state clobbered.
                 art.last_key = None
+                art.skipped = False
         elif ident is not None and np.cover_key:
             # Learn whether this station's art is per-song (usable as a
             # visual-match reference) or a logo that repeats across songs.
