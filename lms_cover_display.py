@@ -1562,6 +1562,12 @@ def run(cfg: Config):
                         text_until = 0.0
                         prefetch_failed_key = None
                         hires_pending = None
+                        # Synced players share cover keys, so stale retry
+                        # state would follow the track across the switch:
+                        # a half-spent budget and a retry-key match that
+                        # suppresses the hires fallback on first failure.
+                        cover_retry_key = None
+                        cover_retry_n = 0
                         radio_ident = None
                         radio_surface = None
                         radio_stage = None
@@ -1657,10 +1663,16 @@ def run(cfg: Config):
                                     radio_surface = cached[0]
                                 elif ident not in radio_neg:
                                     radio_stage = "search"
-                        if ident is not None and np.cover_key:
+                        elif ident is not None and np.cover_key:
                             # Learn whether this station's art is per-song
                             # (usable as a visual-match reference) or a logo
-                            # that repeats across songs.
+                            # that repeats across songs. ONLY on ident-STABLE
+                            # sweeps: at the song boundary the art key often
+                            # still belongs to the PREVIOUS song (stations
+                            # push metadata a sweep before the artwork
+                            # churns), and learning there would sentinel
+                            # every per-song key as a "logo", silently
+                            # disabling the dHash gate on replays.
                             seen = radio_key_idents.get(np.cover_key)
                             if seen is None:
                                 radio_key_idents[np.cover_key] = ident

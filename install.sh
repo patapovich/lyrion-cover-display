@@ -21,7 +21,7 @@ fi
 
 echo ">> Installing system packages..."
 apt-get update
-apt-get install -y python3-pygame python3-numpy fonts-dejavu-core
+apt-get install -y python3-pygame python3-pil fonts-dejavu-core fonts-freefont-ttf
 
 echo ">> Adding $RUN_USER to the video group (for /dev/fb0 + vcgencmd access)..."
 usermod -aG video "$RUN_USER"

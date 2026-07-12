@@ -25,7 +25,7 @@ cd lyrion-cover-display
 sudo ./install.sh
 ```
 
-Installs the deps (`python3-pygame python3-numpy fonts-dejavu-core`), the systemd
+Installs the deps (`python3-pygame python3-pil fonts-dejavu-core fonts-freefont-ttf`), the systemd
 service, the boot-splash + `maintenance` helpers, and a copy of `config.ini`.
 Then:
 
