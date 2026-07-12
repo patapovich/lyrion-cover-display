@@ -28,6 +28,7 @@ class FakeArt:
     def __init__(self, surface=None):
         self.surface = surface
         self.cache = {}
+        self.last_key = None
 
 
 class FakeDisplay:
@@ -36,7 +37,7 @@ class FakeDisplay:
     def prewarm_background(self, surf):
         pass
 
-    def crossfade(self, surf, np, alpha, seconds):
+    def crossfade(self, surf, np, alpha, seconds, abort_check=None):
         self.painted = surf
 
 
@@ -46,27 +47,39 @@ class TestObserve(unittest.TestCase):
         self.cfg = cfg()
 
     def test_new_ident_arms_search(self):
-        self.r.observe(self.cfg, np_(), {})
+        self.r.observe(self.cfg, np_(), FakeArt())
         self.assertEqual(self.r.stage, "search")
         self.assertEqual(self.r.ident, ("a", "b"))
 
     def test_negative_cached_ident_does_not_arm(self):
         self.r.neg[("a", "b")] = True
-        self.r.observe(self.cfg, np_(), {})
+        self.r.observe(self.cfg, np_(), FakeArt())
         self.assertIsNone(self.r.stage)
 
     def test_cached_cover_adopted_without_search(self):
         surf = object()
-        self.r.observe(self.cfg, np_(), {("radio", "a", "b"): (surf, True)})
+        self.r.covers[("a", "b")] = surf
+        self.r.observe(self.cfg, np_(), FakeArt())
         self.assertIs(self.r.surface, surf)
         self.assertIsNone(self.r.stage)
 
+    def test_surface_loss_forces_station_art_refetch(self):
+        # P1 invariant: while our cover owned the screen the station-art
+        # fetch was skipped; when the cover goes away (ident flip with no
+        # cached replacement), art.last_key must reset so the art refires.
+        self.r.covers[("a", "b")] = object()
+        art = FakeArt()
+        art.last_key = "url:/k1"
+        self.r.observe(self.cfg, np_(), art)          # adopts cover
+        self.r.observe(self.cfg, np_(album="Z"), art)  # flip, no cache
+        self.assertIsNone(art.last_key)
+
     def test_ident_change_clears_transients_keeps_knowledge(self):
-        self.r.observe(self.cfg, np_(), {})
+        self.r.observe(self.cfg, np_(), FakeArt())
         self.r.try_n, self.r.next_try = 2, 123.0
         self.r.backoff_until = 456.0
         self.r.neg[("x", "y")] = True
-        self.r.observe(self.cfg, np_(album="C"), {})
+        self.r.observe(self.cfg, np_(album="C"), FakeArt())
         self.assertEqual(self.r.try_n, 0)
         self.assertEqual(self.r.next_try, 0.0)
         self.assertEqual(self.r.backoff_until, 456.0)   # survives (storm fix)
@@ -75,20 +88,20 @@ class TestObserve(unittest.TestCase):
     def test_boundary_sweep_does_not_learn(self):
         # Song boundary: ident changes while the art key still belongs to
         # the previous song — must NOT be learned (B2 sentinel-mislabel fix).
-        self.r.observe(self.cfg, np_(album="B", key="url:/old-art"), {})
+        self.r.observe(self.cfg, np_(album="B", key="url:/old-art"), FakeArt())
         self.assertNotIn("url:/old-art", self.r.key_idents)
 
     def test_stable_sweep_learns_then_sentinels_logo(self):
-        self.r.observe(self.cfg, np_(key="url:/logo"), {})       # boundary
-        self.r.observe(self.cfg, np_(key="url:/logo"), {})       # stable
+        self.r.observe(self.cfg, np_(key="url:/logo"), FakeArt())   # boundary
+        self.r.observe(self.cfg, np_(key="url:/logo"), FakeArt())   # stable
         self.assertEqual(self.r.key_idents["url:/logo"], ("a", "b"))
-        self.r.observe(self.cfg, np_(album="C", key="url:/logo"), {})  # bnd
-        self.r.observe(self.cfg, np_(album="C", key="url:/logo"), {})  # stbl
+        self.r.observe(self.cfg, np_(album="C", key="url:/logo"), FakeArt())
+        self.r.observe(self.cfg, np_(album="C", key="url:/logo"), FakeArt())
         self.assertIs(self.r.key_idents["url:/logo"], mod._RadioLookup.LOGO)
 
     def test_per_song_art_true_for_unique_key(self):
-        self.r.observe(self.cfg, np_(key="url:/k1"), {})
-        self.r.observe(self.cfg, np_(key="url:/k1"), {})
+        self.r.observe(self.cfg, np_(key="url:/k1"), FakeArt())
+        self.r.observe(self.cfg, np_(key="url:/k1"), FakeArt())
         self.assertTrue(self.r.per_song_art(np_(key="url:/k1")))
         self.assertFalse(self.r.per_song_art(np_(key="current")))
 
@@ -97,7 +110,7 @@ class TestReadyGuard(unittest.TestCase):
     def setUp(self):
         self.r = mod._RadioLookup()
         self.cfg = cfg()
-        self.r.observe(self.cfg, np_(), {})
+        self.r.observe(self.cfg, np_(), FakeArt())
 
     def test_ready_when_armed_and_engaged(self):
         self.assertTrue(self.r.ready(100.0, self.cfg, np_(),
@@ -125,7 +138,7 @@ class TestStepSearch(unittest.TestCase):
     def setUp(self):
         self.r = mod._RadioLookup()
         self.cfg = cfg()
-        self.r.observe(self.cfg, np_(), {})
+        self.r.observe(self.cfg, np_(), FakeArt())
         self.art = FakeArt()
 
     def step(self, now=100.0):
@@ -169,8 +182,8 @@ class TestStepFetch(unittest.TestCase):
         self.r = mod._RadioLookup()
         self.cfg = cfg()
         self.np = np_(key="url:/k1")
-        self.r.observe(self.cfg, self.np, {})
-        self.r.observe(self.cfg, self.np, {})        # stable: learn key
+        self.r.observe(self.cfg, self.np, FakeArt())
+        self.r.observe(self.cfg, self.np, FakeArt())  # stable: learn key
         self.art = FakeArt(surface=object())
 
     def step(self, now=100.0, art=None):
@@ -186,7 +199,7 @@ class TestStepFetch(unittest.TestCase):
             painted, wake = self.step()
         self.assertTrue(painted)
         self.assertIs(self.r.surface, surf)
-        self.assertIn(("radio", "a", "b"), self.art.cache)
+        self.assertIn(("a", "b"), self.r.covers)
         self.assertIsNone(self.r.stage)
 
     def test_reject_walks_to_next_candidate(self):
@@ -245,7 +258,7 @@ class TestStepFetch(unittest.TestCase):
 class TestSwitchReset(unittest.TestCase):
     def test_switch_clears_transients_keeps_knowledge(self):
         r = mod._RadioLookup()
-        r.observe(cfg(), np_(), {})
+        r.observe(cfg(), np_(), FakeArt())
         r.neg[("x", "y")] = True
         r.key_idents["k"] = ("x", "y")
         r.backoff_until = 99.0

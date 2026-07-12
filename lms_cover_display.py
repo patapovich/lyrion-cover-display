@@ -1023,12 +1023,15 @@ class Display:
         self.present()
 
     def crossfade(self, cover, np: NowPlaying, text_alpha: int = 255,
-                  seconds: float = 0.4):
+                  seconds: float = 0.4, abort_check=None):
         """Blend from whatever is on screen to a freshly composed frame with
         `cover` — used when a sharper variant replaces art already up (hi-res
         upgrade, radio cover) so the swap reads as a focus-pull, not a cut.
         Frame pacing comes from the fb blit itself (~100-150ms/frame on the
-        Pi 3); the loop blocks its caller (the heavy slot) for `seconds`."""
+        Pi 3); the loop blocks its caller (the heavy slot) for `seconds`.
+        abort_check() truthy between frames snaps straight to the final
+        frame — a queued user event (pause/skip) must not wait out a fade
+        stacked on top of the fetch that preceded it."""
         if seconds <= 0 or self.blanked:
             self.render(cover, np, text_alpha)
             return
@@ -1039,8 +1042,8 @@ class Display:
         t0 = time.monotonic()
         for i in range(30):                    # hard cap, belt against stalls
             k = min(1.0, (time.monotonic() - t0) / seconds)
-            if i == 29:
-                k = 1.0   # cap hit (fast presents): force the final frame
+            if i == 29 or (abort_check is not None and abort_check()):
+                k = 1.0   # cap hit / event queued: force the final frame
             new.set_alpha(int(255 * k))
             self.screen.blit(old, (0, 0))
             self.screen.blit(new, (0, 0))
@@ -1575,7 +1578,20 @@ def run(cfg: Config):
                             text_until = (float("inf") if show_secs <= 0
                                           else now + show_secs + fade)
                         # Fetch cover only when the art identity changes.
-                        if np.cover_key and np.cover_key != art.last_key:
+                        if (np.cover_key and np.cover_key != art.last_key
+                                and radio.surface is not None
+                                and _radio_ident(cfg, np) == radio.ident):
+                            # The radio cover owns the screen for this very
+                            # song (render/classify use radio.surface), so
+                            # the station art is dead weight — skip its
+                            # ~1.4s imageproxy fetch per artwork churn.
+                            # observe() clears last_key when the radio cover
+                            # goes away, so the art refetches then.
+                            art.last_key = np.cover_key
+                            art.surface = None
+                            art.hires_pending = None
+                            art.t0 = None
+                        elif np.cover_key and np.cover_key != art.last_key:
                             art.t0 = time.monotonic()
                             art.hires_pending = None       # previous upgrade is moot
                             cached = art.cache.get(np.cover_key)
@@ -1628,7 +1644,7 @@ def run(cfg: Config):
                                 art.t0 = None   # nothing painted; no timing line
 
                         # --- radio cover lookup: (re)arm on song identity --- #
-                        radio.observe(cfg, np, art.cache)
+                        radio.observe(cfg, np, art)
                         was_playing = True
                     else:
                         was_playing = False
@@ -1782,13 +1798,7 @@ def run(cfg: Config):
             # burst must stay responsive, and its later tracks make this
             # upgrade moot anyway. Gate on the freshly classified state, not
             # the sweep-local `engaged` (stale after a poll exception).
-            events_queued = False
-            if listener.connected:
-                try:
-                    events_queued = bool(
-                        select.select([listener.fileno()], [], [], 0)[0])
-                except (OSError, ValueError):
-                    pass
+            events_queued = _events_pending(listener)
             if (art.hires_pending and art.hires_pending == np.cover_key == art.last_key
                     and np.cover_hires_url and state in _ENGAGED
                     and not events_queued):
@@ -1812,7 +1822,9 @@ def run(cfg: Config):
                         alpha = _text_alpha(time.monotonic(), text_until,
                                             show_secs, fade)
                         display.crossfade(art.surface, np, alpha,
-                                          cfg.upgrade_fade_seconds)
+                                          cfg.upgrade_fade_seconds,
+                                          abort_check=lambda:
+                                          _events_pending(listener))
                         last_state_id = None   # next pass re-derives identity
                         print(f"art hires upgrade painted in "
                               f"{(time.monotonic() - t0) * 1000:.0f}ms",
@@ -1838,7 +1850,8 @@ def run(cfg: Config):
                 painted, wake_at = radio.step(
                     now, cfg, np, client, display, art,
                     lambda: _text_alpha(time.monotonic(), text_until,
-                                        show_secs, fade))
+                                        show_secs, fade),
+                    abort_fn=lambda: _events_pending(listener))
                 if painted:
                     last_state_id = None   # next pass re-derives identity
                 if wake_at is not None:
@@ -1847,7 +1860,7 @@ def run(cfg: Config):
             # (c) Prefetch the upcoming track's cover + backdrop. Hi-res
             # directly — its cost is invisible here — falling back to the
             # fast variant so a hi-res hiccup still yields instant swaps.
-            elif (playing and np.next_cover_key
+            elif (playing and not events_queued and np.next_cover_key
                     and np.next_cover_key != np.cover_key
                     and np.next_cover_key not in art.cache
                     and np.next_cover_key != art.prefetch_failed_key):
@@ -1929,6 +1942,19 @@ def _trim_cache(cache: dict, limit: int = 5):
     # first insert — intentional; do not assume re-store refreshes recency.
     while len(cache) > limit:
         cache.pop(next(iter(cache)))
+
+
+def _events_pending(listener) -> bool:
+    """Zero-timeout peek: is a pushed LMS event already waiting in the CLI
+    socket? Heavy work defers on truthy (a queued pause/skip must not wait
+    out a blocking fetch or a fade); the subscription is narrow, so a queued
+    line is a real state change."""
+    if not listener.connected:
+        return False
+    try:
+        return bool(select.select([listener.fileno()], [], [], 0)[0])
+    except (OSError, ValueError):
+        return False
 
 
 class _TrackArt:
@@ -2231,6 +2257,10 @@ class _RadioLookup:
         self.backoff_until = 0.0  # global cooldown after transient failures;
         #                           survives ident flips (dual-metadata
         #                           stations must not fire a search storm)
+        self.covers = {}       # ident -> surface: found covers get their own
+        #                        small cache — in the shared art cache they
+        #                        churned out within ~2 songs and every replay
+        #                        repaid the full search+gate (~5-7s)
         self.reset_for_switch()
 
     def reset_for_switch(self):
@@ -2242,27 +2272,35 @@ class _RadioLookup:
 
     # -- sweep-side ------------------------------------------------------- #
 
-    def observe(self, cfg: Config, np: "NowPlaying", art_cache: dict):
+    def observe(self, cfg: Config, np: "NowPlaying", art: "_TrackArt"):
         """Track the song identity: (re)arm the lookup on change, adopt a
         cached cover, and learn station-art key semantics on stable sweeps."""
         ident = _radio_ident(cfg, np)
         if ident != self.ident:
             self.ident = ident
-            # No drop_background here: the surface usually stays in the art
-            # cache (replays re-adopt it), and dual-metadata stations flip
-            # idents A<->B every few seconds — dropping would recompute a
-            # ~1s backdrop per flip. The bg cache's FIFO bounds pinning.
+            had_surface = self.surface is not None
+            # No drop_background here: the surface usually stays in the
+            # covers cache (replays re-adopt it), and dual-metadata stations
+            # flip idents A<->B every few seconds — dropping would recompute
+            # a ~1s backdrop per flip. The bg cache's FIFO bounds pinning.
             self.surface = None
             self.stage = None
             self.try_n, self.next_try = 0, 0.0
             if ident is not None:
-                cached = art_cache.get(("radio",) + ident)
+                cached = self.covers.get(ident)
                 if cached is not None:
                     # Replayed song: adopt before this pass's render — zero
                     # station-logo flash.
-                    self.surface = cached[0]
+                    self.surface = cached
                 elif ident not in self.neg:
                     self.stage = "search"
+            if had_surface and self.surface is None:
+                # While our cover owned the screen, the change path SKIPS
+                # station-art fetches (they'd be dead weight). Now the cover
+                # is gone, so force the station art to (re)fetch — without
+                # this, a mid-song ident flip (jingle metadata) would leave
+                # the panel with no art at all and nothing to refire.
+                art.last_key = None
         elif ident is not None and np.cover_key:
             # Learn whether this station's art is per-song (usable as a
             # visual-match reference) or a logo that repeats across songs.
@@ -2315,11 +2353,13 @@ class _RadioLookup:
         return max(self.next_try, self.backoff_until) if backoff else self.next_try
 
     def step(self, now, cfg: Config, np: "NowPlaying", client, display,
-             art: "_TrackArt", alpha_fn):
+             art: "_TrackArt", alpha_fn, abort_fn=None):
         """Run ONE lookup stage — exactly one blocking network op (the
         search POST, or one candidate fetch through the imageproxy).
         Returns (painted, wake_at): painted -> the caller must invalidate
-        its render dedup; wake_at -> earliest useful re-entry time."""
+        its render dedup; wake_at -> earliest useful re-entry time.
+        abort_fn: passed to the crossfade so a queued user event snaps the
+        blend to its final frame instead of riding out the fade."""
         t0 = time.monotonic()
         if self.stage == "search":
             res = _radio_cover_search(cfg, np.artist.strip(),
@@ -2442,10 +2482,11 @@ class _RadioLookup:
 
         try:
             display.prewarm_background(surf)
-            art.cache[("radio",) + self.ident] = (surf, True)
-            _trim_cache(art.cache)
+            self.covers[self.ident] = surf
+            _trim_cache(self.covers, 3)
             self.surface = surf
-            display.crossfade(surf, np, alpha_fn(), cfg.upgrade_fade_seconds)
+            display.crossfade(surf, np, alpha_fn(), cfg.upgrade_fade_seconds,
+                              abort_check=abort_fn)
             print(f"radio cover painted in "
                   f"{(time.monotonic() - t0) * 1000:.0f}ms "
                   f"({source} tier {tier}"
