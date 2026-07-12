@@ -453,6 +453,29 @@ _SCDN_MARK_HI = "i.scdn.co%2Fimage%2F" + _SCDN_HIRES
 _SCDN_MARK_LO = "i.scdn.co%2Fimage%2F" + _SCDN_FAST
 
 
+def _img_spec(cfg: Config) -> str:
+    # LMS size-spec filename: server-side fetch+resize, .png = lossless
+    # (see the _art_url docstring for the full rationale). ONE place to
+    # change the quality knob — this string historically got edited at
+    # five separate sites in bulk.
+    px = cfg.cover_px
+    return f"image_{px}x{px}_o.png"
+
+
+def _music_spec(cfg: Config) -> str:
+    # /music/<id>/... variant of the same spec (cover_ prefix).
+    px = cfg.cover_px
+    return f"cover_{px}x{px}_o.png"
+
+
+def _imageproxy_url(cfg: Config, remote_url: str) -> str:
+    """Wrap an external image URL in the LMS imageproxy with the size spec:
+    LMS fetches + resizes server-side and the Pi only ever does plain LAN
+    HTTP — clock-independent (no TLS before NTP) and bandwidth-bounded."""
+    return (f"{cfg.base_url}/imageproxy/"
+            f"{quote(remote_url, safe='')}/{_img_spec(cfg)}")
+
+
 def _art_url(cfg: Config, track: dict):
     """(cover_key, cover_url, hires_url) for a status playlist_loop entry, or
     ("", "", "") when the track carries no usable art identity. hires_url is
@@ -480,7 +503,6 @@ def _art_url(cfg: Config, track: dict):
     renderer smoothscales the rest — one resample, best quality."""
     coverid = track.get("coverid")
     artwork_url = track.get("artwork_url")
-    px = cfg.cover_px
     if artwork_url:
         # Normalise the key across size classes so 82c1/b273 emissions of the
         # same image share one cache identity (fork toggles, stale metadata).
@@ -489,12 +511,11 @@ def _art_url(cfg: Config, track: dict):
             artwork_url = artwork_url[len(cfg.base_url):]  # absolute-to-LMS
         if artwork_url.startswith("http"):
             # External absolute URL: route through the LMS imageproxy.
-            url = (f"{cfg.base_url}/imageproxy/"
-                   f"{quote(artwork_url, safe='')}/image_{px}x{px}_o.png")
+            url = _imageproxy_url(cfg, artwork_url)
         else:
             rel = artwork_url.lstrip("/")
             if rel.startswith("imageproxy/") and rel.endswith("/image.png"):
-                rel = rel[:-len("image.png")] + f"image_{px}x{px}_o.png"
+                rel = rel[:-len("image.png")] + _img_spec(cfg)
             url = f"{cfg.base_url}/{rel}"
         if _SCDN_MARK_HI in url:
             return key, url.replace(_SCDN_HIRES, _SCDN_FAST, 1), url
@@ -506,7 +527,7 @@ def _art_url(cfg: Config, track: dict):
         # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
         # blur-fill ourselves, so we want the original aspect ratio.
         return (f"cid:{coverid}",
-                f"{cfg.base_url}/music/{quote(str(coverid))}/cover_{px}x{px}_o.png",
+                f"{cfg.base_url}/music/{quote(str(coverid))}/{_music_spec(cfg)}",
                 "")
     return "", "", ""
 
@@ -541,11 +562,10 @@ class NowPlaying:
         if not np.cover_key:
             # Last resort: the "current cover" shortcut for this player.
             # cover_hires_url stays "" — this form is final, never upgraded.
-            px = cfg.cover_px
             pid = status.get("playerid", "")
             np.cover_key = "current"
             np.cover_url = (
-                f"{cfg.base_url}/music/current/cover_{px}x{px}_o.png?player={quote(pid)}"
+                f"{cfg.base_url}/music/current/{_music_spec(cfg)}?player={quote(pid)}"
             )
         # The sweep asks for two playlist entries; entry [1] is the upcoming
         # track, whose art we prefetch so the swap at the song change is
@@ -1449,35 +1469,10 @@ def run(cfg: Config):
     players_resolved = []     # currently-connected configured MACs, priority order
     last_active = None        # MAC most recently seen playing (sticky idle target)
     prev_selected = None      # to detect a display switch and reset transient state
-    cover_surface = None
-    cover_cache = {}          # cover_key -> (decoded surface, final)
-    # `final` False = the fast 640px variant is cached and a hi-res upgrade is
-    # still worthwhile; True = hi-res fetched, or the art has no hi-res form.
-    last_key = None
-    cover_retry_key = None    # cover_key being re-fetched after a failed attempt
-    cover_retry_n = 0         # bounded fast retries for that key (stale-clock etc.)
-    prefetch_failed_key = None  # next-cover key that failed; one attempt only
-    hires_pending = None      # cover_key awaiting its hi-res upgrade fetch
-    art_t0 = None             # art change detected at this time (for the log line)
-    art_src = ""              # "prefetched" (cache hit) or "fetched"
-    # Radio cover lookup: a found cover lives in radio_surface and out-ranks
-    # cover_surface (station art) at render; station-art machinery untouched.
-    radio_ident = None        # (artist, albumish) of the armed/shown lookup
-    radio_surface = None      # exact-match cover for radio_ident, or None
-    radio_stage = None        # None | "search" | ("fetch", big_url, source)
-    radio_try_n = 0           # transient-failure retries for this ident
-    radio_next_try = 0.0      # earliest monotonic time for the next retry
-    radio_backoff_until = 0.0  # global cooldown after ANY transient search
-    #                            failure; deliberately NOT reset on ident
-    #                            change — a dual-metadata station flipping
-    #                            idents every few seconds during a service
-    #                            outage must not fire an unpaced search storm
-    radio_neg = {}            # ident -> True: search completed, no exact match
-    radio_key_idents = {}     # cover_key -> first ident seen with it, or the
-    #                           LOGO sentinel once seen with a second ident;
-    #                           distinguishes per-song station art (usable as
-    #                           a visual-match reference) from station logos
-    RADIO_LOGO = object()     # sentinel for "this art key repeats across songs"
+    art = _TrackArt()         # station/track art state (see class docstring)
+    # Radio cover lookup: a found cover lives in radio.surface and out-ranks
+    # art.surface (station art) at render; station-art machinery untouched.
+    radio = _RadioLookup()    # full state machine (see class docstring)
     last_track = None         # (title, artist, album, cover_key) — detects track changes
     last_state_id = None      # render identity, to avoid needless redraws
     idle_since = None         # entered stop / paused-blank at this monotonic time
@@ -1555,26 +1550,16 @@ def run(cfg: Config):
                         prev_selected = selected
                         idle_since = power_off_since = unreachable_since = None
                         was_playing = False
-                        cover_surface = None
-                        last_key = None
                         last_track = None
                         last_state_id = None
                         text_until = 0.0
-                        prefetch_failed_key = None
-                        hires_pending = None
-                        # Synced players share cover keys, so stale retry
-                        # state would follow the track across the switch:
-                        # a half-spent budget and a retry-key match that
-                        # suppresses the hires fallback on first failure.
-                        cover_retry_key = None
-                        cover_retry_n = 0
-                        radio_ident = None
-                        radio_surface = None
-                        radio_stage = None
-                        radio_try_n, radio_next_try = 0, 0.0
-                        # radio_neg / radio_key_idents / radio_backoff_until
-                        # survive: station/song/service knowledge, not player
-                        # state. Backdrop entries age out via the bg FIFO.
+                        # One-call resets (incl. the retry pair: synced
+                        # players share cover keys, so stale retry state
+                        # would otherwise follow the track across a switch).
+                        # Radio neg/key_idents/backoff survive by design —
+                        # see the _RadioLookup survival-policy table.
+                        art.reset()
+                        radio.reset_for_switch()
 
                     np, power = polls[selected]
                     # "Engaged" = audio active (play, or pause kept lit): drives the
@@ -1590,11 +1575,11 @@ def run(cfg: Config):
                             text_until = (float("inf") if show_secs <= 0
                                           else now + show_secs + fade)
                         # Fetch cover only when the art identity changes.
-                        if np.cover_key and np.cover_key != last_key:
-                            art_t0 = time.monotonic()
-                            hires_pending = None       # previous upgrade is moot
-                            cached = cover_cache.get(np.cover_key)
-                            art_src = "prefetched" if cached is not None else "fetched"
+                        if np.cover_key and np.cover_key != art.last_key:
+                            art.t0 = time.monotonic()
+                            art.hires_pending = None       # previous upgrade is moot
+                            cached = art.cache.get(np.cover_key)
+                            art.src = "prefetched" if cached is not None else "fetched"
                             if cached is not None:
                                 surf, final = cached
                             else:
@@ -1604,7 +1589,7 @@ def run(cfg: Config):
                                 surf = _fetch_cover(client, display, np.cover_url)
                                 final = not np.cover_hires_url
                                 if (surf is None and np.cover_hires_url
-                                        and np.cover_key != cover_retry_key):
+                                        and np.cover_key != art.retry_key):
                                     # First failure for this key only (the
                                     # bounded retry below re-enters here every
                                     # ~3s — one slow fallback, not twenty):
@@ -1613,83 +1598,43 @@ def run(cfg: Config):
                                                         np.cover_hires_url)
                                     final = True
                                 if surf is not None:
-                                    cover_cache[np.cover_key] = (surf, final)
-                                    _trim_cache(cover_cache)
+                                    art.cache[np.cover_key] = (surf, final)
+                                    _trim_cache(art.cache)
                             # Adopt the new art; if the fetch failed, drop to
                             # no-cover for this key so we show the status screen
                             # rather than the *previous* track's cover.
-                            cover_surface = surf
+                            art.surface = surf
                             if surf is not None:
                                 # Success: stop re-fetching this key.
-                                last_key = np.cover_key
-                                cover_retry_key = None
+                                art.last_key = np.cover_key
+                                art.retry_key = None
                                 if not final and np.cover_hires_url:
-                                    hires_pending = np.cover_key
+                                    art.hires_pending = np.cover_key
                             else:
                                 # Fetch failed — e.g. a stale boot clock (no RTC +
                                 # ro overlay can't persist fake-hwclock) makes the
                                 # cover CDN's TLS cert read "not yet valid" until NTP
-                                # syncs. Do NOT advance last_key: keep showing status,
+                                # syncs. Do NOT advance art.last_key: keep showing status,
                                 # but re-fetch this same key soon instead of caching
                                 # the miss until the track changes. Bounded, then we
                                 # fall back to the normal heartbeat re-sweep.
-                                if np.cover_key != cover_retry_key:
-                                    cover_retry_key = np.cover_key
-                                    cover_retry_n = 0
-                                if cover_retry_n < COVER_RETRY_MAX:
-                                    cover_retry_n += 1
+                                if np.cover_key != art.retry_key:
+                                    art.retry_key = np.cover_key
+                                    art.retry_n = 0
+                                if art.retry_n < COVER_RETRY_MAX:
+                                    art.retry_n += 1
                                     heartbeat_at = min(heartbeat_at,
                                                        now + COVER_RETRY)
-                                art_t0 = None   # nothing painted; no timing line
+                                art.t0 = None   # nothing painted; no timing line
 
                         # --- radio cover lookup: (re)arm on song identity --- #
-                        ident = _radio_ident(cfg, np)
-                        if ident != radio_ident:
-                            radio_ident = ident
-                            # No drop_background here: the surface usually
-                            # stays in cover_cache (replays re-adopt it), and
-                            # dual-metadata stations flip idents A<->B every
-                            # few seconds — dropping would recompute a ~1s
-                            # backdrop per flip. The bg cache's own FIFO cap
-                            # bounds any pinning.
-                            radio_surface = None
-                            radio_stage = None
-                            radio_try_n, radio_next_try = 0, 0.0
-                            if ident is not None:
-                                cached = cover_cache.get(("radio",) + ident)
-                                if cached is not None:
-                                    # Replayed song: adopt before this pass's
-                                    # render — zero station-logo flash.
-                                    radio_surface = cached[0]
-                                elif ident not in radio_neg:
-                                    radio_stage = "search"
-                        elif ident is not None and np.cover_key:
-                            # Learn whether this station's art is per-song
-                            # (usable as a visual-match reference) or a logo
-                            # that repeats across songs. ONLY on ident-STABLE
-                            # sweeps: at the song boundary the art key often
-                            # still belongs to the PREVIOUS song (stations
-                            # push metadata a sweep before the artwork
-                            # churns), and learning there would sentinel
-                            # every per-song key as a "logo", silently
-                            # disabling the dHash gate on replays.
-                            seen = radio_key_idents.get(np.cover_key)
-                            if seen is None:
-                                radio_key_idents[np.cover_key] = ident
-                                _trim_cache(radio_key_idents, 64)
-                            elif seen is not RADIO_LOGO and seen != ident:
-                                # Re-insert (pop first) so an ACTIVE logo's
-                                # sentinel refreshes its FIFO position — it
-                                # must outlive per-song keys, not age from
-                                # the station's first-ever song.
-                                radio_key_idents.pop(np.cover_key)
-                                radio_key_idents[np.cover_key] = RADIO_LOGO
+                        radio.observe(cfg, np, art.cache)
                         was_playing = True
                     else:
                         was_playing = False
 
                     state = classify(cfg, np, power,
-                                     (radio_surface or cover_surface) is not None)
+                                     (radio.surface or art.surface) is not None)
                     playing = state in (S_PLAYING, S_PAUSED)
                     status_msg = _STATUS_TEXT[state]
                 except (*NET_ERRORS, ValueError, RuntimeError,
@@ -1706,7 +1651,7 @@ def run(cfg: Config):
                              else S_UNREACHABLE)
                     playing = False
                     status_msg = _STATUS_TEXT[state]
-                    # (hires_pending and ALL radio_* state deliberately survive
+                    # (art.hires_pending and ALL radio_* state deliberately survive
                     # a poll failure: the heavy-slot `state in _ENGAGED` gates
                     # already block fetches until a sweep succeeds, and keeping
                     # them armed lets the work resume after a one-blip recovery
@@ -1787,27 +1732,27 @@ def run(cfg: Config):
                     # Resting, but HDMI kept on (feature disabled): legacy black-fill.
                     display.blank()
                 elif (state in (S_PLAYING, S_PAUSED)
-                        and (radio_surface or cover_surface) is not None):
+                        and (radio.surface or art.surface) is not None):
                     alpha = _text_alpha(now, text_until, show_secs, fade)
-                    state_id = (state, last_key, alpha, last_track)
+                    state_id = (state, art.last_key, alpha, last_track)
                     if state_id != last_state_id or display.blanked:
                         # A radio-song cover out-ranks the station art. Song
                         # changes repaint via last_track; the mid-track swap-in
                         # renders inline from the heavy slot below.
-                        display.render(radio_surface or cover_surface, np, alpha)
+                        display.render(radio.surface or art.surface, np, alpha)
                         last_state_id = state_id
-                        if art_t0 is not None:
+                        if art.t0 is not None:
                             print(f"art swap painted in "
-                                  f"{(time.monotonic() - art_t0) * 1000:.0f}ms "
-                                  f"({art_src})", flush=True)
-                            art_t0 = None
+                                  f"{(time.monotonic() - art.t0) * 1000:.0f}ms "
+                                  f"({art.src})", flush=True)
+                            art.t0 = None
                 elif state == S_UNREACHABLE:
                     # Server/wifi blip: hold whatever is on screen (usually the last
                     # cover) so a brief outage is invisible. Only after the grace —
                     # or if we never had a cover (cold boot) — do we show
                     # "connecting…". Forcing last_state_id=None makes the cover
                     # repaint cleanly once LMS returns.
-                    if ((radio_surface or cover_surface) is None
+                    if ((radio.surface or art.surface) is None
                             or unreachable_since is None
                             or now - unreachable_since >= cfg.unreachable_grace):
                         display.status_screen(status_msg)
@@ -1844,7 +1789,7 @@ def run(cfg: Config):
                         select.select([listener.fileno()], [], [], 0)[0])
                 except (OSError, ValueError):
                     pass
-            if (hires_pending and hires_pending == np.cover_key == last_key
+            if (art.hires_pending and art.hires_pending == np.cover_key == art.last_key
                     and np.cover_hires_url and state in _ENGAGED
                     and not events_queued):
                 # (np.cover_hires_url can be "" for the SAME key when the
@@ -1855,10 +1800,10 @@ def run(cfg: Config):
                 heavy_fired = True
                 if surf is not None:
                     try:
-                        old = cover_surface
+                        old = art.surface
                         display.prewarm_background(surf)
-                        cover_cache[np.cover_key] = (surf, True)
-                        cover_surface = surf
+                        art.cache[np.cover_key] = (surf, True)
+                        art.surface = surf
                         if old is not None:
                             display.drop_background(old)
                         # Repaint NOW — nothing else wakes the loop for up to
@@ -1866,7 +1811,7 @@ def run(cfg: Config):
                         # art, sharper — reads as a focus-pull, not a cut.
                         alpha = _text_alpha(time.monotonic(), text_until,
                                             show_secs, fade)
-                        display.crossfade(cover_surface, np, alpha,
+                        display.crossfade(art.surface, np, alpha,
                                           cfg.upgrade_fade_seconds)
                         last_state_id = None   # next pass re-derives identity
                         print(f"art hires upgrade painted in "
@@ -1875,208 +1820,37 @@ def run(cfg: Config):
                     except Exception as exc:  # noqa: BLE001
                         print(f"[warn] hires upgrade render failed: {exc}",
                               flush=True)
-                        # cover_surface already holds the hi-res frame; force
+                        # art.surface already holds the hi-res frame; force
                         # the render section to repaint it cleanly next pass
                         # (state_id can't tell fast/hires surfaces apart).
                         last_state_id = None
-                    hires_pending = None
+                    art.hires_pending = None
                 else:
                     # Transient failure: keep the fast art, disarm for this
                     # play-through. The cache entry stays (surf, False), so a
                     # later cache hit (album replay) re-arms the upgrade.
-                    hires_pending = None
+                    art.hires_pending = None
 
-            # (b) Radio cover lookup: search pass, then (next pass) fetch the
-            # picked cover through the LMS imageproxy. Guards mirror (a):
-            # fresh state, no queued events; plus the retry pacing and a check
-            # that the song the stage was armed for is still the one playing.
-            elif (radio_stage and state in _ENGAGED and not events_queued
-                    and now >= radio_next_try and now >= radio_backoff_until
-                    and radio_ident is not None
-                    and _radio_ident(cfg, np) == radio_ident):
+            # (b) Radio cover lookup: one state-machine stage per pass (search,
+            # then one candidate fetch+verify per pass) — see _RadioLookup.
+            elif radio.ready(now, cfg, np, state, events_queued):
                 heavy_fired = True
-                t0 = time.monotonic()
-                if radio_stage == "search":
-                    res = _radio_cover_search(cfg, np.artist.strip(),
-                                              np.album.strip()
-                                              or np.title.strip())
-                    if res[0] == "ok":
-                        radio_stage = ("fetch", res[1])   # candidate list
-                        radio_try_n = 0   # fetch gets its own retry budget
-                    elif res[0] == "nomatch":
-                        # Definitive: the search completed and nothing passed
-                        # the exact-match filters. Never re-search this song.
-                        radio_neg[radio_ident] = True
-                        _trim_cache(radio_neg, 64)
-                        radio_stage = None
-                        print(f"radio: no exact match for "
-                              f"{np.artist} / {np.album or np.title} "
-                              f"({(time.monotonic() - t0) * 1000:.0f}ms)",
-                              flush=True)
-                    else:
-                        # Transient (network/TLS/gate hiccup — e.g. stale
-                        # pre-NTP boot clock). Bounded, spaced retries; NOT
-                        # negative-cached, so a replay hours later starts
-                        # fresh even after giving up now. Logged per failure
-                        # — an "API gate change?" here must be visible on
-                        # its FIRST occurrence, not after the give-up.
-                        radio_try_n += 1
-                        radio_backoff_until = now + 20.0
-                        print(f"radio: search failed "
-                              f"(try {radio_try_n}/3): {res[1]}", flush=True)
-                        if radio_try_n >= 3:
-                            radio_stage = None
-                        else:
-                            radio_next_try = now + 10.0 * radio_try_n
-                            heartbeat_at = min(heartbeat_at,
-                                               max(radio_next_try,
-                                                   radio_backoff_until))
-                else:
-                    # Visual verification: when the station provides
-                    # per-song art (its key has never been seen with a
-                    # different song), the found cover must perceptually
-                    # match it. Station logos (key repeats across songs)
-                    # and art-less stations skip the gate — and there ONLY
-                    # tier-1 (strict text equality) candidates may show:
-                    # the looser tiers exist strictly under dHash cover.
-                    ref_ok = (cover_surface is not None
-                              and np.cover_key not in ("", "current")
-                              and radio_key_idents.get(np.cover_key)
-                              == radio_ident)
-                    cands = radio_stage[1]
-                    # Head = first candidate usable RIGHT NOW. The filter is
-                    # deliberately non-destructive: ref_ok can be False just
-                    # because the station art is mid-retry, and the loose
-                    # candidates must still be there when it lands.
-                    head = next((i for i, c in enumerate(cands)
-                                 if ref_ok or c[2] == 1), None)
-                    surf = None
-                    if head is not None:
-                        big_url, source, tier = cands[head]
-                        surf = _fetch_cover(client, display,
-                                            _radio_proxy_url(cfg, big_url))
-                    if head is None:
-                        # Only loose candidates and no visual reference.
-                        if (cover_surface is None
-                                and np.cover_key not in ("", "current")
-                                and radio_key_idents.get(np.cover_key)
-                                == radio_ident):
-                            # Transient: this song HAS its own art but the
-                            # fetch is still retrying — check again shortly.
-                            radio_try_n += 1
-                            if radio_try_n >= 3:
-                                radio_stage = None   # this occurrence only
-                            else:
-                                radio_next_try = now + 10.0 * radio_try_n
-                                heartbeat_at = min(heartbeat_at,
-                                                   radio_next_try)
-                        else:
-                            # Definitive for this song: logo/art-less
-                            # station -> loose tiers unusable by design.
-                            # Negative-cache like a nomatch, else every
-                            # replay (or A<->B metadata flip, which turns
-                            # the art key into the LOGO sentinel) would
-                            # re-search the aggregator per occurrence.
-                            radio_neg[radio_ident] = True
-                            _trim_cache(radio_neg, 64)
-                            radio_stage = None
-                            print("radio: only loose matches and no "
-                                  "per-song art to verify against — "
-                                  "skipped", flush=True)
-                    elif surf is not None:
-                        dist = None
-                        if ref_ok:
-                            dist = _hamming(_dhash(display.pygame, surf),
-                                            _dhash(display.pygame,
-                                                   cover_surface))
-                        if (dist is not None
-                                and dist > cfg.radio_cover_match_threshold):
-                            # Looks like different artwork than the stream's
-                            # own — reject this candidate and move to the
-                            # next source's variant (a different edition /
-                            # scan may match; one fetch per pass, unpark
-                            # chains them). NOT put into radio_neg: on a
-                            # logo station's very first song the "reference"
-                            # is the not-yet-identified logo itself, and a
-                            # permanent reject would poison a correct cover.
-                            # By the song's next replay the logo key has been
-                            # seen with other idents -> sentinel -> the gate
-                            # skips it and the cover goes through. Genuinely
-                            # wrong art just gets re-rejected per replay.
-                            cands.pop(head)
-                            if dist > cfg.radio_cover_match_threshold + 8:
-                                # FAR miss: the stores all carry the same
-                                # artwork family (observed live: five sources
-                                # rejected at an identical distance) — scan
-                                # variants differ by a few bits, not ten, so
-                                # none of the rest can pass. Fetching them
-                                # one by one just grinds for ~2s each.
-                                if cands:
-                                    print(f"radio: dhash {dist}/64 far off "
-                                          f"— skipping {len(cands)} "
-                                          f"remaining candidate(s)",
-                                          flush=True)
-                                cands = []
-                            radio_stage = ("fetch", cands) if cands else None
-                            radio_try_n = 0   # fresh budget per candidate
-                            print(f"radio: cover rejected, dhash {dist}/64 "
-                                  f"> {cfg.radio_cover_match_threshold} "
-                                  f"({source} tier {tier}"
-                                  + (f"; trying {cands[0][1]}" if cands
-                                     else "; no more candidates") + ")",
-                                  flush=True)
-                        else:
-                            try:
-                                display.prewarm_background(surf)
-                                cover_cache[("radio",) + radio_ident] = (surf,
-                                                                         True)
-                                _trim_cache(cover_cache)
-                                radio_surface = surf
-                                alpha = _text_alpha(time.monotonic(),
-                                                    text_until, show_secs,
-                                                    fade)
-                                display.crossfade(radio_surface, np, alpha,
-                                                  cfg.upgrade_fade_seconds)
-                                last_state_id = None
-                                print(f"radio cover painted in "
-                                      f"{(time.monotonic() - t0) * 1000:.0f}"
-                                      f"ms ({source} tier {tier}"
-                                      + (f", dhash {dist}/64" if dist
-                                         is not None else "") + ")",
-                                      flush=True)
-                            except Exception as exc:  # noqa: BLE001
-                                print(f"[warn] radio cover render failed: "
-                                      f"{exc}", flush=True)
-                                last_state_id = None
-                            radio_stage = None
-                    else:
-                        # Imageproxy/decode failure: keep the search result,
-                        # retry just the fetch on the same pacing; after the
-                        # budget, fall through to the next candidate (a
-                        # different CDN may serve fine).
-                        radio_try_n += 1
-                        radio_backoff_until = now + 20.0
-                        if radio_try_n >= 3:
-                            cands.pop(head)
-                            radio_stage = ("fetch", cands) if cands else None
-                            radio_try_n = 0
-                            print("radio: cover fetch gave up on "
-                                  f"{source}"
-                                  + (f"; trying {cands[0][1]}" if cands
-                                     else "") , flush=True)
-                        else:
-                            radio_next_try = now + 10.0 * radio_try_n
-                            heartbeat_at = min(heartbeat_at,
-                                               max(radio_next_try,
-                                                   radio_backoff_until))
+                painted, wake_at = radio.step(
+                    now, cfg, np, client, display, art,
+                    lambda: _text_alpha(time.monotonic(), text_until,
+                                        show_secs, fade))
+                if painted:
+                    last_state_id = None   # next pass re-derives identity
+                if wake_at is not None:
+                    heartbeat_at = min(heartbeat_at, wake_at)
 
             # (c) Prefetch the upcoming track's cover + backdrop. Hi-res
             # directly — its cost is invisible here — falling back to the
             # fast variant so a hi-res hiccup still yields instant swaps.
             elif (playing and np.next_cover_key
                     and np.next_cover_key != np.cover_key
-                    and np.next_cover_key not in cover_cache
-                    and np.next_cover_key != prefetch_failed_key):
+                    and np.next_cover_key not in art.cache
+                    and np.next_cover_key != art.prefetch_failed_key):
                 surf = None
                 final = True
                 if np.next_cover_hires_url:
@@ -2086,8 +1860,8 @@ def run(cfg: Config):
                     surf = _fetch_cover(client, display, np.next_cover_url)
                     final = not np.next_cover_hires_url
                 if surf is not None:
-                    cover_cache[np.next_cover_key] = (surf, final)
-                    _trim_cache(cover_cache)
+                    art.cache[np.next_cover_key] = (surf, final)
+                    _trim_cache(art.cache)
                     try:
                         display.prewarm_background(surf)
                     except Exception as exc:  # noqa: BLE001
@@ -2096,7 +1870,7 @@ def run(cfg: Config):
                 else:
                     # One attempt per key: the normal change-path (with its
                     # bounded retry) covers it if this track actually plays.
-                    prefetch_failed_key = np.next_cover_key
+                    art.prefetch_failed_key = np.next_cover_key
 
             if heavy_fired:
                 # This pass's fetch budget is spent; wake shortly so the next
@@ -2155,6 +1929,32 @@ def _trim_cache(cache: dict, limit: int = 5):
     # first insert — intentional; do not assume re-store refreshes recency.
     while len(cache) > limit:
         cache.pop(next(iter(cache)))
+
+
+class _TrackArt:
+    """Station/track art state for the main loop: the painted cover, the
+    change-detection key, the bounded fetch-retry machinery, the one-shot
+    prefetch guard and the hi-res upgrade arm. One object so the
+    player-switch reset is a single call — the old inline var block shipped
+    a bug by omitting the retry pair (synced players share cover keys).
+
+    `cache` (cover_key -> (surface, final)) deliberately SURVIVES a player
+    switch: keys are track identities, not player state."""
+
+    def __init__(self):
+        self.cache = {}      # cover_key -> (decoded surface, final); final
+        #                      False = fast 640px cached, upgrade worthwhile
+        self.reset()
+
+    def reset(self):
+        self.surface = None            # currently painted station/track art
+        self.last_key = None           # advances only on successful fetch
+        self.retry_key = None          # cover_key being re-fetched after fail
+        self.retry_n = 0               # bounded fast retries for that key
+        self.prefetch_failed_key = None  # next-cover key: one attempt only
+        self.hires_pending = None      # cover_key awaiting hi-res upgrade
+        self.t0 = None                 # art change seen at (for timing log)
+        self.src = ""                  # "prefetched" | "fetched"
 
 
 # --------------------------------------------------------------------------- #
@@ -2373,12 +2173,8 @@ def _radio_cover_search(cfg: Config, artist: str, album: str):
 
 
 def _radio_proxy_url(cfg: Config, big_url: str) -> str:
-    # Fetch the picked cover through the LMS imageproxy: the Pi only does
-    # plain LAN HTTP (clock-independent, see _art_url) and LMS resizes the
-    # often-huge original server-side.
-    px = cfg.cover_px
-    return (f"{cfg.base_url}/imageproxy/"
-            f"{quote(big_url, safe='')}/image_{px}x{px}_o.png")
+    # Picked covers ride the same imageproxy path as all other art.
+    return _imageproxy_url(cfg, big_url)
 
 
 def _dhash(pygame, surf) -> int:
@@ -2406,6 +2202,259 @@ def _dhash(pygame, surf) -> int:
 
 def _hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
+
+
+class _RadioLookup:
+    """State machine for the radio cover lookup: arm on song identity,
+    search (one pass), fetch + visually verify candidates (one pass each),
+    paint. Extracted from the main loop where the same state lived as eight
+    locals with ~30 assignment sites and three subtly different reset
+    policies — now the policies are explicit:
+
+      event          ident surface stage tries || backoff neg key_idents
+      ident change    set     X      X     X   ||    -     -      -
+      player switch   X       X      X     X   ||    -     -      -
+      poll failure    -       -      -     -   ||    -     -      -
+
+    Poll failures clear NOTHING: the heavy-slot gate (ready()) already
+    blocks fetches until a sweep succeeds, and re-arming only happens on an
+    ident CHANGE — clearing here would silently kill the lookup for the
+    rest of the song. backoff_until / neg / key_idents survive everything:
+    they are service/station/song knowledge, not per-player state."""
+
+    LOGO = object()   # sentinel: this art key repeats across songs (a logo)
+    TRIES = 3         # transient-failure budget per stage/candidate
+
+    def __init__(self):
+        self.neg = {}          # ident -> True: definitive no-match
+        self.key_idents = {}   # cover_key -> first ident seen with it | LOGO
+        self.backoff_until = 0.0  # global cooldown after transient failures;
+        #                           survives ident flips (dual-metadata
+        #                           stations must not fire a search storm)
+        self.reset_for_switch()
+
+    def reset_for_switch(self):
+        self.ident = None      # (artist, albumish) of the armed/shown lookup
+        self.surface = None    # exact-match cover for ident, or None
+        self.stage = None      # None | "search" | ("fetch", candidates)
+        self.try_n = 0
+        self.next_try = 0.0
+
+    # -- sweep-side ------------------------------------------------------- #
+
+    def observe(self, cfg: Config, np: "NowPlaying", art_cache: dict):
+        """Track the song identity: (re)arm the lookup on change, adopt a
+        cached cover, and learn station-art key semantics on stable sweeps."""
+        ident = _radio_ident(cfg, np)
+        if ident != self.ident:
+            self.ident = ident
+            # No drop_background here: the surface usually stays in the art
+            # cache (replays re-adopt it), and dual-metadata stations flip
+            # idents A<->B every few seconds — dropping would recompute a
+            # ~1s backdrop per flip. The bg cache's FIFO bounds pinning.
+            self.surface = None
+            self.stage = None
+            self.try_n, self.next_try = 0, 0.0
+            if ident is not None:
+                cached = art_cache.get(("radio",) + ident)
+                if cached is not None:
+                    # Replayed song: adopt before this pass's render — zero
+                    # station-logo flash.
+                    self.surface = cached[0]
+                elif ident not in self.neg:
+                    self.stage = "search"
+        elif ident is not None and np.cover_key:
+            # Learn whether this station's art is per-song (usable as a
+            # visual-match reference) or a logo that repeats across songs.
+            # ONLY on ident-STABLE sweeps: at the song boundary the art key
+            # often still belongs to the PREVIOUS song (stations push
+            # metadata a sweep before the artwork churns), and learning
+            # there would sentinel every per-song key as a "logo".
+            seen = self.key_idents.get(np.cover_key)
+            if seen is None:
+                self.key_idents[np.cover_key] = ident
+                _trim_cache(self.key_idents, 64)
+            elif seen is not self.LOGO and seen != ident:
+                # Re-insert (pop first) so an ACTIVE logo's sentinel
+                # refreshes its FIFO position — it must outlive per-song
+                # keys, not age from the station's first-ever song.
+                self.key_idents.pop(np.cover_key)
+                self.key_idents[np.cover_key] = self.LOGO
+
+    # -- heavy-slot side --------------------------------------------------- #
+
+    def ready(self, now, cfg: Config, np: "NowPlaying", state,
+              events_queued: bool) -> bool:
+        """Guards mirror the hi-res upgrade: fresh classified state, no
+        queued events (skip bursts stay responsive), retry pacing, and the
+        song the stage was armed for must still be the one playing."""
+        return bool(self.stage and state in _ENGAGED and not events_queued
+                    and now >= self.next_try and now >= self.backoff_until
+                    and self.ident is not None
+                    and _radio_ident(cfg, np) == self.ident)
+
+    def per_song_art(self, np: "NowPlaying") -> bool:
+        """The station's current art key is specific to THIS song (has never
+        been seen with another one) — usable as a visual reference."""
+        return (np.cover_key not in ("", "current")
+                and self.key_idents.get(np.cover_key) == self.ident)
+
+    def _arm_retry(self, now: float, backoff: bool):
+        """One transient-failure step: bump the counter, arm the pacing.
+        Returns the wake time for the retry, or None when the TRIES budget
+        is spent — the CALLER decides what giving up means (search: disarm;
+        fetch: advance to the next candidate). backoff=False is for passes
+        that did no network op (waiting for the station art to land) — they
+        must not throttle the whole pipeline."""
+        self.try_n += 1
+        if backoff:
+            self.backoff_until = now + 20.0
+        if self.try_n >= self.TRIES:
+            return None
+        self.next_try = now + 10.0 * self.try_n
+        return max(self.next_try, self.backoff_until) if backoff else self.next_try
+
+    def step(self, now, cfg: Config, np: "NowPlaying", client, display,
+             art: "_TrackArt", alpha_fn):
+        """Run ONE lookup stage — exactly one blocking network op (the
+        search POST, or one candidate fetch through the imageproxy).
+        Returns (painted, wake_at): painted -> the caller must invalidate
+        its render dedup; wake_at -> earliest useful re-entry time."""
+        t0 = time.monotonic()
+        if self.stage == "search":
+            res = _radio_cover_search(cfg, np.artist.strip(),
+                                      np.album.strip() or np.title.strip())
+            if res[0] == "ok":
+                self.stage = ("fetch", res[1])   # candidate list
+                self.try_n = 0   # fetch gets its own retry budget
+            elif res[0] == "nomatch":
+                # Definitive: the search completed and nothing passed the
+                # match tiers. Never re-search this song.
+                self.neg[self.ident] = True
+                _trim_cache(self.neg, 64)
+                self.stage = None
+                print(f"radio: no exact match for "
+                      f"{np.artist} / {np.album or np.title} "
+                      f"({(time.monotonic() - t0) * 1000:.0f}ms)", flush=True)
+            else:
+                # Transient (network/TLS/gate hiccup — e.g. stale pre-NTP
+                # boot clock). Bounded, spaced retries; NOT negative-cached,
+                # so a replay hours later starts fresh. Logged per failure —
+                # an "API gate change?" must be visible on its FIRST
+                # occurrence, not after the give-up.
+                print(f"radio: search failed "
+                      f"(try {self.try_n + 1}/{self.TRIES}): {res[1]}",
+                      flush=True)
+                wake = self._arm_retry(now, backoff=True)
+                if wake is None:
+                    self.stage = None
+                else:
+                    return (False, wake)
+            return (False, None)
+
+        # --- fetch stage: one candidate through the imageproxy + gate --- #
+        # Visual verification: when the station provides per-song art, the
+        # found cover must perceptually match it. Station logos and art-less
+        # stations skip the gate — and there ONLY tier-1 (strict text
+        # equality) candidates may show: the looser tiers exist strictly
+        # under dHash cover.
+        ref_ok = art.surface is not None and self.per_song_art(np)
+        cands = self.stage[1]
+        # Head = first candidate usable RIGHT NOW. The filter is
+        # deliberately non-destructive: ref_ok can be False just because
+        # the station art is mid-retry, and the loose candidates must
+        # still be there when it lands.
+        head = next((i for i, c in enumerate(cands)
+                     if ref_ok or c[2] == 1), None)
+        if head is None:
+            # Only loose candidates and no visual reference.
+            if art.surface is None and self.per_song_art(np):
+                # Transient: this song HAS its own art but the fetch is
+                # still retrying — check again shortly (no backoff: this
+                # pass did no network op).
+                wake = self._arm_retry(now, backoff=False)
+                if wake is None:
+                    self.stage = None   # this occurrence only
+                else:
+                    return (False, wake)
+            else:
+                # Definitive for this song: logo/art-less station -> loose
+                # tiers unusable by design. Negative-cache like a nomatch,
+                # else every replay (or A<->B metadata flip, which turns
+                # the art key into the LOGO sentinel) would re-search the
+                # aggregator per occurrence.
+                self.neg[self.ident] = True
+                _trim_cache(self.neg, 64)
+                self.stage = None
+                print("radio: only loose matches and no per-song art to "
+                      "verify against — skipped", flush=True)
+            return (False, None)
+
+        big_url, source, tier = cands[head]
+        surf = _fetch_cover(client, display, _radio_proxy_url(cfg, big_url))
+        if surf is None:
+            # Imageproxy/decode failure: keep the search result, retry just
+            # the fetch on the same pacing; after the budget, fall through
+            # to the next candidate (a different CDN may serve fine).
+            wake = self._arm_retry(now, backoff=True)
+            if wake is not None:
+                return (False, wake)
+            cands.pop(head)
+            self.stage = ("fetch", cands) if cands else None
+            self.try_n = 0
+            print("radio: cover fetch gave up on "
+                  f"{source}"
+                  + (f"; trying {cands[0][1]}" if cands else ""), flush=True)
+            return (False, None)
+
+        dist = None
+        if ref_ok:
+            dist = _hamming(_dhash(display.pygame, surf),
+                            _dhash(display.pygame, art.surface))
+        if dist is not None and dist > cfg.radio_cover_match_threshold:
+            # Looks like different artwork than the stream's own — reject
+            # this candidate and move to the next source's variant (a
+            # different edition/scan may match; one fetch per pass, the
+            # unpark chains them). NOT put into neg: on a logo station's
+            # very first song the "reference" is the not-yet-identified
+            # logo itself, and a permanent reject would poison a correct
+            # cover. By the song's next replay the logo key has been seen
+            # with other idents -> sentinel -> the gate skips it and the
+            # cover goes through. Genuinely wrong art just gets re-rejected
+            # per replay.
+            cands.pop(head)
+            if dist > cfg.radio_cover_match_threshold + 8:
+                # FAR miss: the stores all carry the same artwork family
+                # (observed live: five sources rejected at an identical
+                # distance) — scan variants differ by a few bits, not ten,
+                # so none of the rest can pass either.
+                if cands:
+                    print(f"radio: dhash {dist}/64 far off — skipping "
+                          f"{len(cands)} remaining candidate(s)", flush=True)
+                cands = []
+            self.stage = ("fetch", cands) if cands else None
+            self.try_n = 0   # fresh budget per candidate
+            print(f"radio: cover rejected, dhash {dist}/64 "
+                  f"> {cfg.radio_cover_match_threshold} ({source} tier {tier}"
+                  + (f"; trying {cands[0][1]}" if cands
+                     else "; no more candidates") + ")", flush=True)
+            return (False, None)
+
+        try:
+            display.prewarm_background(surf)
+            art.cache[("radio",) + self.ident] = (surf, True)
+            _trim_cache(art.cache)
+            self.surface = surf
+            display.crossfade(surf, np, alpha_fn(), cfg.upgrade_fade_seconds)
+            print(f"radio cover painted in "
+                  f"{(time.monotonic() - t0) * 1000:.0f}ms "
+                  f"({source} tier {tier}"
+                  + (f", dhash {dist}/64" if dist is not None else "") + ")",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] radio cover render failed: {exc}", flush=True)
+        self.stage = None
+        return (True, None)   # painted either way: force a clean re-render
 
 
 # --------------------------------------------------------------------------- #
