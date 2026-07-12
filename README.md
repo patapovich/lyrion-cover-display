@@ -16,6 +16,24 @@ framebuffer** (`/dev/fb0`), light enough for a **Raspberry Pi 3 A+ (512MB)**.
 - **Multi-player:** track several players by priority, show one at a time.
 - **Event-driven:** updates push from the LMS CLI (port 9090), polling fallback.
 - **Powers HDMI off when idle** (`vcgencmd`), wakes on play.
+- **Hi-res Spotify covers:** Spotify's CDN serves the same album art at 2000px
+  under a different URL prefix. The display derives that URL itself (works
+  with stock Spotty): the next track's cover is prefetched hi-res, so album
+  swaps are instant *and* full quality; a manual skip paints the fast 640px
+  variant immediately and crossfades to hi-res a couple of seconds later.
+- **Radio covers:** for internet-radio songs (with an album tag) it looks up
+  proper album art on the covers.musichoarders.xyz aggregator. Strict by
+  design: only exact artist+album matches (plus punctuation variants and
+  Deluxe/Single/Remastered-style editions of the same release), and when the
+  station sends its own per-song artwork the found cover must also *look*
+  like it (perceptual dHash check) or it is rejected. Station logos are
+  detected and never used as a false reference. Everything fails soft to the
+  station's own art. *Caveat: that site has no public API — the client mimics
+  its web app and may stop working at any time.*
+- **Crossfade upgrades:** when a sharper cover replaces art already on
+  screen, it blends in (`upgrade_fade_seconds`) instead of cutting.
+- **Script-aware text:** per-line font fallback to FreeSerif for scripts
+  DejaVu lacks (e.g. Ethiopic artist names from radio metadata).
 
 ## Install (on the Pi)
 
@@ -50,9 +68,24 @@ Edit `config.ini` — full annotated list in
 | `rotate`             | `0/90/180/270` for a portrait mount (default `90`)             |
 | `background`         | `blur` (saturated, blurred, zoomed full-cover backdrop, lms-material style) or `black` |
 | `idle_blank_seconds` | Hold last cover this long after stop, then power HDMI off (default `300`) |
+| `upgrade_fade_seconds` | Crossfade when a sharper cover replaces art on screen; `0` = hard cut (default `0.4`) |
+| `radio_cover_search` | Master switch for the radio cover lookup (default `true`)      |
+| `radio_cover_country` | Store country for the search (default `de`; `fi` is rejected upstream) |
+| `radio_cover_sources` | Sources in quality-preference order (default `applemusic, tidal, amazonmusic, spotify`) |
+| `radio_cover_title_fallback` | Album tag missing → search the song title as an album name (default `false`, strict) |
+| `radio_cover_timeout` | Wall-clock deadline per search, seconds (default `8.0`)       |
+| `radio_cover_match_threshold` | Max dHash distance (0–64) vs the station's per-song art (default `16`; matches observed ≤14, rejects ≥23) |
+| `radio_cover_loose_match` | Accept punctuation variants + decorated editions — only under the dHash gate (default `true`) |
 
 Updates are event-driven via the LMS CLI (`cli_port`, default `9090`); set
 `cli_user`/`cli_pass` only if your LMS has CLI auth.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests        # offline, no Pi/network needed
+RUN_LIVE=1 python3 -m unittest discover -s tests   # + live aggregator queries
+```
 
 ## Notes
 
