@@ -234,6 +234,13 @@ class LMSClient:
         self.cfg = cfg
         self.rpc_url = f"{cfg.base_url}/jsonrpc.js"
         self._opener = urllib.request.build_opener()   # follows redirects
+        # The LMS imageproxy 301-redirects some remote artwork URLs back to
+        # the origin host instead of proxying them (e.g. podcast/show images
+        # on station websites). Several such hosts sit behind WordPress-style
+        # firewalls that 403 the default "Python-urllib/x.y" user agent, so
+        # identify honestly but not as a scripting library.
+        self._opener.addheaders = [
+            ("User-Agent", "Mozilla/5.0 (compatible; lms-cover-display/1.0)")]
 
     def request(self, player: str, command: list) -> dict:
         payload = {"id": 1, "method": "slim.request", "params": [player, command]}
