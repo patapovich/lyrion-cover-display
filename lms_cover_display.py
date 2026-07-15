@@ -55,7 +55,7 @@ DEFAULTS = {
     "cli_port": "9090",      # LMS command-line interface port (event stream)
     "cli_user": "",          # CLI login user (blank = no auth, the common case)
     "cli_pass": "",          # CLI login password
-    "event_heartbeat": "30.0",  # safety re-sweep interval while the socket is up
+    "event_heartbeat": "10.0",  # safety re-sweep interval while the socket is up
     "cover_px": "1200",      # requested cover size from LMS (server-side resize)
     "idle_blank_seconds": "300",   # hold last cover this long after stop, then blank
     "text_show_seconds": "8",      # show artist/title this long after a track change (0 = always)
@@ -367,6 +367,16 @@ class EventListener:
                 (self.cfg.server_host, self.cfg.cli_port),
                 timeout=self.cfg.request_timeout)
             sock.settimeout(self.cfg.request_timeout)
+            # TCP keepalive: a silently dead peer (LMS restart, network blip)
+            # otherwise looks connected forever — select() just never fires and
+            # the display trails by the heartbeat interval. Probe after 30s
+            # idle, every 10s, 3 misses -> recv fails -> mark_down -> the loop
+            # flips to fast polling and reconnects.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):        # Linux
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
             if self.cfg.cli_user or self.cfg.cli_pass:
                 sock.sendall(
                     f"login {quote(self.cfg.cli_user)} "
@@ -1831,7 +1841,7 @@ def run(cfg: Config):
                         if old is not None:
                             display.drop_background(old)
                         # Repaint NOW — nothing else wakes the loop for up to
-                        # event_heartbeat (30s) mid-track. Crossfade: same
+                        # event_heartbeat (10s) mid-track. Crossfade: same
                         # art, sharper — reads as a focus-pull, not a cut.
                         alpha = _text_alpha(time.monotonic(), text_until,
                                             show_secs, fade)
