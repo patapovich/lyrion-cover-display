@@ -87,6 +87,26 @@ class TestParse(unittest.TestCase):
         st.pop("remote")
         self.assertFalse(mod.NowPlaying.parse(CFG, st).remote)
 
+    def test_station_from_remote_title(self):
+        st = {"mode": "play", "remote": 1, "playerid": "aa",
+              "playlist_loop": [{"title": "Programme",
+                                 "remote_title": "Radio Helsinki"}]}
+        self.assertEqual(mod.NowPlaying.parse(CFG, st).station,
+                         "Radio Helsinki")
+
+    def test_station_cleared_when_it_is_the_title(self):
+        # No title tag at all: remote_title becomes the title; don't repeat it.
+        st = {"mode": "play", "remote": 1, "playerid": "aa",
+              "playlist_loop": [{"remote_title": "Radio Helsinki"}]}
+        np = mod.NowPlaying.parse(CFG, st)
+        self.assertEqual(np.title, "Radio Helsinki")
+        self.assertEqual(np.station, "")
+
+    def test_no_station_for_local_tracks(self):
+        st = {"mode": "play", "playerid": "aa",
+              "playlist_loop": [{"title": "t", "remote_title": "x"}]}
+        self.assertEqual(mod.NowPlaying.parse(CFG, st).station, "")
+
 
 class TestRadioIdent(unittest.TestCase):
     def setUp(self):

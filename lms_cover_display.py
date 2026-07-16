@@ -562,6 +562,7 @@ class NowPlaying:
     next_cover_url: str = ""     # upcoming track's art URL (prefetch)
     next_cover_hires_url: str = ""
     remote: bool = False         # current track is a stream (radio, Spotify, …)
+    station: str = ""            # stream/station name (e.g. "Radio Helsinki")
 
     @staticmethod
     def parse(cfg: Config, status: dict) -> "NowPlaying":
@@ -574,6 +575,13 @@ class NowPlaying:
         np.artist = track.get("artist", "") or track.get("albumartist", "")
         np.album = track.get("album", "")
         np.remote = bool(status.get("remote") or track.get("remote"))
+        if np.remote:
+            # Station name for the info band. Programme-only segments (no song
+            # metadata) would otherwise show just the programme title with no
+            # hint of the channel; skip it when it already IS the title.
+            station = track.get("remote_title", "")
+            if station and station != np.title:
+                np.station = station
 
         np.cover_key, np.cover_url, np.cover_hires_url = _art_url(cfg, track)
         if not np.cover_key:
@@ -1202,9 +1210,12 @@ class Display:
         if np.title:
             specs.append((self._line_font_path(self._font_title_path, np.title),
                           self._base, np.title, (255, 255, 255)))
-        if np.artist:
-            specs.append((self._line_font_path(self._font_sub_path, np.artist),
-                          int(self._base * 0.7), np.artist, (210, 210, 210)))
+        # Programme-only radio segments carry no artist; show the station name
+        # in its slot so the channel stays identifiable (Material does the same).
+        sub_line = np.artist or np.station
+        if sub_line:
+            specs.append((self._line_font_path(self._font_sub_path, sub_line),
+                          int(self._base * 0.7), sub_line, (210, 210, 210)))
         if self.cfg.show_album and np.album:
             specs.append((self._line_font_path(self._font_sub_path, np.album),
                           int(self._base * 0.7), np.album, (170, 170, 170)))
@@ -1258,7 +1269,7 @@ class Display:
         """Build (and cache per track) a full-screen SRCALPHA overlay holding
         the scrim + artist/title text, so render() can fade it in/out by
         scaling the overlay's alpha."""
-        key = (np.title, np.artist, np.album, self.cfg.show_album)
+        key = (np.title, np.artist, np.album, np.station, self.cfg.show_album)
         if getattr(self, "_ov_key", None) == key:
             return self._ov_surf
 
