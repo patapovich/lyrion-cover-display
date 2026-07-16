@@ -337,8 +337,11 @@ class EventListener:
 
     # Subscribe to just the state-relevant notifications (not mixer/time, which
     # would fire constantly). newsong/pause/stop cover play state; power covers
-    # on/off; client covers a player (dis)connecting.
-    SUBSCRIBE = "subscribe playlist,power,client"
+    # on/off; client covers a player (dis)connecting; newmetadata is how
+    # out-of-band radio metadata plugins (RadioNowPlaying) announce a track
+    # change — streams fire NO playlist event, so without it every radio
+    # song change waits for the safety heartbeat.
+    SUBSCRIBE = "subscribe playlist,power,client,newmetadata"
     BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
     MAX_LINE = 8192            # drop+reconnect if a line grows past this (no \n)
 
