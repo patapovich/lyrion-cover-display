@@ -546,10 +546,37 @@ def _art_url(cfg: Config, track: dict):
         # The _o suffix = keep the artwork's native aspect, max dimension px,
         # no square pad/crop (plain cover_NxN.jpg squares it). We scale and
         # blur-fill ourselves, so we want the original aspect ratio.
+        #
+        # Fetch by track id, not coverid: a coverid is a hash over the file's
+        # path/mtime/size, and touching the file after the scan strands the
+        # DB row — /music/<coverid>/... 404s forever (until a rescan) while
+        # /music/<track id>/... still resolves, which is the form Material
+        # uses. coverid stays the cache KEY: an album's tracks share it,
+        # track ids don't. Remote entries can carry synthetic negative ids,
+        # so only a positive int id is trusted as a fetch handle.
+        # int-coerce: LMS's Perl JSON flips scalars between int and string
+        # form (see _lms_flag) — this server emits id as int today, but the
+        # remote flag proved the form can change.
+        try:
+            track_id = int(track.get("id", 0))
+        except (TypeError, ValueError):
+            track_id = 0
+        art_ref = track_id if track_id > 0 else coverid
         return (f"cid:{coverid}",
-                f"{cfg.base_url}/music/{quote(str(coverid))}/{_music_spec(cfg)}",
+                f"{cfg.base_url}/music/{quote(str(art_ref))}/{_music_spec(cfg)}",
                 "")
     return "", "", ""
+
+
+def _lms_flag(v) -> bool:
+    """LMS emits boolean flags as an int OR a numeric string depending on
+    the field and code path — playlist_loop entries carry remote as "0"/"1"
+    strings, and bool("0") is True. Coerce through int; anything
+    non-numeric (or absent) counts as unset."""
+    try:
+        return bool(int(v))
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass
@@ -577,7 +604,7 @@ class NowPlaying:
         np.title = track.get("title", "") or track.get("remote_title", "")
         np.artist = track.get("artist", "") or track.get("albumartist", "")
         np.album = track.get("album", "")
-        np.remote = bool(status.get("remote") or track.get("remote"))
+        np.remote = _lms_flag(status.get("remote")) or _lms_flag(track.get("remote"))
         if np.remote:
             # Station name for the info band. Programme-only segments (no song
             # metadata) would otherwise show just the programme title with no

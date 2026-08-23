@@ -52,6 +52,27 @@ class TestArtUrl(unittest.TestCase):
         self.assertEqual(h, "")
         self.assertIn("/music/42/cover_1200x1200_o.png", u)
 
+    def test_coverid_fetches_by_track_id(self):
+        # coverid is a path/mtime hash that goes stale when the file is
+        # touched after the scan (the /music/<coverid>/ form then 404s
+        # forever); the track-id form keeps resolving. Key stays coverid —
+        # it is shared across an album's tracks.
+        k, u, h = mod._art_url(CFG, {"coverid": "fceef5dd", "id": 26077})
+        self.assertEqual(k, "cid:fceef5dd")
+        self.assertEqual(h, "")
+        self.assertIn("/music/26077/cover_1200x1200_o.png", u)
+
+    def test_coverid_ignores_synthetic_negative_id(self):
+        k, u, _ = mod._art_url(CFG, {"coverid": "abc", "id": -140})
+        self.assertEqual(k, "cid:abc")
+        self.assertIn("/music/abc/cover_1200x1200_o.png", u)
+
+    def test_coverid_accepts_numeric_string_id(self):
+        # Perl JSON can emit the id as "26077" — same int/string flip-flop
+        # as the remote flag.
+        _, u, _ = mod._art_url(CFG, {"coverid": "abc", "id": "26077"})
+        self.assertIn("/music/26077/cover_1200x1200_o.png", u)
+
     def test_placeholder_passthrough(self):
         _, u, h = mod._art_url(CFG, {"artwork_url": "/html/images/cover.png"})
         self.assertEqual(h, "")
@@ -86,6 +107,17 @@ class TestParse(unittest.TestCase):
         self.assertTrue(mod.NowPlaying.parse(CFG, st).remote)
         st.pop("remote")
         self.assertFalse(mod.NowPlaying.parse(CFG, st).remote)
+
+    def test_remote_flag_string_zero_is_local(self):
+        # Live LMS playlist_loop entries carry remote as the STRING "0" for
+        # local tracks; bool("0") is True, which once flipped every local
+        # track to remote (radio cover search fired on library songs).
+        st = {"mode": "play", "playerid": "aa",
+              "playlist_loop": [{"title": "t", "remote": "0",
+                                 "coverid": "42", "id": 7}]}
+        self.assertFalse(mod.NowPlaying.parse(CFG, st).remote)
+        st["playlist_loop"][0]["remote"] = "1"
+        self.assertTrue(mod.NowPlaying.parse(CFG, st).remote)
 
     def test_station_from_remote_title(self):
         st = {"mode": "play", "remote": 1, "playerid": "aa",
