@@ -50,8 +50,11 @@ echo ">> Installing the initramfs boot-splash hooks..."
 sed "s|__APPDIR__|$APPDIR|g" "$APPDIR/initramfs/hooks/coversplash" \
   > /etc/initramfs-tools/hooks/coversplash
 chmod 0755 /etc/initramfs-tools/hooks/coversplash
-install -m 0755 "$APPDIR/initramfs/scripts/init-premount/coversplash" \
-  /etc/initramfs-tools/scripts/init-premount/coversplash
+install -D -m 0755 "$APPDIR/initramfs/scripts/init-top/coversplash" \
+  /etc/initramfs-tools/scripts/init-top/coversplash
+# Older installs placed the script in init-premount; drop it so the splash
+# isn't painted twice.
+rm -f /etc/initramfs-tools/scripts/init-premount/coversplash
 update-initramfs -u
 
 echo ">> Disabling getty on tty1 (the display owns that console)..."
