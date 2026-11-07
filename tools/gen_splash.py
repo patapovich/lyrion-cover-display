@@ -16,8 +16,12 @@ Outputs (portrait 1200x1600 unless noted):
                                and packed BGRX (what initramfs/splash-fb paint)
   assets/splash_plymouth.png - landscape 1600x1200 (plymouth; kept consistent)
 
-Run:  python3 tools/gen_splash.py
+Run:  python3 tools/gen_splash.py [--rotate 0|90|180|270]
+      (default: the `rotate` key of config.ini, else 90 — must match the app's
+      setting or the boot splash comes up upside-down / sideways vs the app)
 """
+import argparse
+import configparser
 import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -147,7 +151,33 @@ def _band_text(img, status):
         y += h + pad
 
 
+# Canvas-to-framebuffer rotation, mirroring lms_cover_display.FBDisplay._ROT_ANGLE
+# (pygame angle, positive = counterclockwise). np.rot90 k=1 is also
+# counterclockwise, so k = angle / 90; PIL's Image.rotate takes the same angle.
+_ROT_ANGLE = {0: 0, 90: -90, 180: 180, 270: 90}
+
+
+def _config_rotate():
+    """`rotate` from ../config.ini (falls back to the app's default 90)."""
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(HERE, "config.ini"))
+    try:
+        return cp.getint("lms", "rotate", fallback=90) % 360
+    except ValueError:
+        return 90
+
+
 def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--rotate", type=int, default=None, choices=(0, 90, 180, 270),
+                    help="panel rotation as in config.ini (default: config.ini "
+                         "`rotate`, else 90)")
+    args = ap.parse_args()
+    rot = _config_rotate() if args.rotate is None else args.rotate
+    if rot not in _ROT_ANGLE:
+        raise SystemExit(f"rotate must be one of 0/90/180/270 (got {rot})")
+    angle = _ROT_ANGLE[rot]
+
     base = _base()
 
     # splashbg.png — no text; the app draws "Lyrion" + live status over this
@@ -161,22 +191,24 @@ def main():
 
     # splash_plymouth.png — landscape 1600x1200 (rotate; plymouth disabled but
     # kept consistent)
-    boot_rgb.rotate(-90, expand=True).save(os.path.join(ASSETS, "splash_plymouth.png"))
+    boot_rgb.rotate(angle, expand=True).save(os.path.join(ASSETS, "splash_plymouth.png"))
 
     # splash.raw — what initramfs/splash-fb paint: the portrait image rotated to
     # the 1600x1200 firmware framebuffer, packed 32-bit BGRX. The app composes a
-    # portrait canvas and rot90(k=3) onto the fb; reproduce that exact mapping so
-    # the boot splash and the app's first frame align pixel-for-pixel.
+    # portrait canvas and rotates it by the same angle onto the fb; reproduce that
+    # exact mapping so the boot splash and the app's first frame align
+    # pixel-for-pixel.
     arr = np.asarray(boot_rgb)                                 # (1600,1200,3) RGB
-    fb = np.rot90(arr, 3)                                      # -> (1200,1600,3)
-    out = np.empty((1200, 1600, 4), np.uint8)
+    fb = np.rot90(arr, angle // 90)                            # -> (1200,1600,3)
+    out = np.empty(fb.shape[:2] + (4,), np.uint8)
     out[..., 0] = fb[..., 2]                                   # B
     out[..., 1] = fb[..., 1]                                   # G
     out[..., 2] = fb[..., 0]                                   # R
     out[..., 3] = 255
     out.tofile(os.path.join(ASSETS, "splash.raw"))
 
-    print("wrote splashbg.png, splash.png, splash_plymouth.png, splash.raw")
+    print(f"wrote splashbg.png, splash.png, splash_plymouth.png, splash.raw "
+          f"(rotate={rot}, fb {fb.shape[1]}x{fb.shape[0]})")
 
 
 if __name__ == "__main__":

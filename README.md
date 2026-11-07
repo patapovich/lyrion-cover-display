@@ -102,7 +102,10 @@ RUN_LIVE=1 python3 -m unittest discover -s tests   # + live aggregator queries
 
 - **Black screen:** check `journalctl -u lms-cover-display -f`; reboot after
   install so `video` group + disabled `getty@tty1` take effect.
-- **Wrong orientation:** set `rotate = 270` (or 90/180) and restart.
+- **Wrong orientation:** set `rotate = 270` (or 90/180) and restart. Then
+  regenerate the boot splash for the same rotation and re-embed it:
+  `python3 tools/gen_splash.py --rotate 270` (defaults to config.ini's
+  `rotate`), copy `assets/splash.raw` to the Pi, `sudo ./scripts/deploy.sh`.
 - **Config edits don't stick:** the card is read-only — `sudo maintenance rw` first.
 - **"No players connected":** the player must be on and connected to LMS
   (`--list-players`).
