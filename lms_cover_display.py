@@ -241,6 +241,9 @@ class LMSClient:
         # identify honestly but not as a scripting library.
         self._opener.addheaders = [
             ("User-Agent", "Mozilla/5.0 (compatible; lms-cover-display/1.0)")]
+        # track id -> artwork_url ("" = none) for online-library tracks,
+        # insertion-ordered so the oldest entry is evicted first.
+        self._lib_art: dict[int, str] = {}
 
     def request(self, player: str, command: list) -> dict:
         payload = {"id": 1, "method": "slim.request", "params": [player, command]}
@@ -319,7 +322,51 @@ class LMSClient:
         # a=artist l=album c=coverid K=artwork_url x=remote N=remote title
         # Two playlist entries: [0] = the current track, [1] = the upcoming
         # track (used to prefetch its cover so song changes swap instantly).
-        return self.request(player, ["status", "-", 2, "tags:aclKxN"])
+        result = self.request(player, ["status", "-", 2, "tags:aclKxN"])
+        self._fill_library_artwork(result.get("playlist_loop") or [])
+        return result
+
+    # Online-library tracks (albums a streaming plugin such as Spot On
+    # imported into the LMS database) are real DB rows: positive id,
+    # remote=1, cover stored as an https URL. status builds playlist_loop
+    # from a direct SQL hash that has no column for that URL, so K is
+    # silently dropped and only coverid comes back. That loses the Spotify
+    # CDN image id, and with it the hi-res 2000px variant. songinfo
+    # resolves the track object instead and does return artwork_url, so
+    # look it up once per track id and patch it into the entry.
+    LIB_ART_CAP = 256
+
+    def _fill_library_artwork(self, loop: list) -> None:
+        for entry in loop:
+            if entry.get("artwork_url") or not _lms_flag(entry.get("remote")):
+                continue
+            try:
+                track_id = int(entry.get("id", 0))
+            except (TypeError, ValueError):
+                continue
+            if track_id <= 0:
+                continue   # synthetic id: a stream, not a library row
+            url = self._lib_art.get(track_id)
+            if url is None:
+                try:
+                    res = self.request("", ["songinfo", 0, 100,
+                                            f"track_id:{track_id}", "tags:K"])
+                except Exception as exc:  # noqa: BLE001
+                    # Not cached: retried on the next sweep. Meanwhile the
+                    # coverid fallback in _art_url still paints the cover.
+                    print(f"[warn] songinfo artwork lookup failed for track "
+                          f"{track_id}: {exc}", flush=True)
+                    continue
+                url = ""
+                for item in res.get("songinfo_loop") or []:
+                    if item.get("artwork_url"):
+                        url = item["artwork_url"]
+                        break
+                self._lib_art[track_id] = url
+                while len(self._lib_art) > self.LIB_ART_CAP:
+                    self._lib_art.pop(next(iter(self._lib_art)))
+            if url:
+                entry["artwork_url"] = url
 
 
 # --------------------------------------------------------------------------- #
@@ -557,9 +604,19 @@ def _art_url(cfg: Config, track: dict):
         # int-coerce: LMS's Perl JSON flips scalars between int and string
         # form (see _lms_flag) — this server emits id as int today, but the
         # remote flag proved the form can change.
+        #
+        # Remote library rows (online-library imports) are the exception:
+        # they have no file behind them, and LMS answers the track-id form
+        # with HTTP 500 ("Artwork resize failed") while the coverid form
+        # works. Their coverid hashes the cover URL, not a file's mtime, so
+        # it doesn't go stale. Normally these entries carry an artwork_url
+        # (LMSClient._fill_library_artwork); this is the fallback for when
+        # that lookup failed.
         try:
             track_id = int(track.get("id", 0))
         except (TypeError, ValueError):
+            track_id = 0
+        if _lms_flag(track.get("remote")):
             track_id = 0
         art_ref = track_id if track_id > 0 else coverid
         return (f"cid:{coverid}",

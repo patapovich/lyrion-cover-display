@@ -73,6 +73,15 @@ class TestArtUrl(unittest.TestCase):
         _, u, _ = mod._art_url(CFG, {"coverid": "abc", "id": "26077"})
         self.assertIn("/music/26077/cover_1200x1200_o.png", u)
 
+    def test_remote_library_row_fetches_by_coverid(self):
+        # Online-library rows (Spot On imports) have no file: LMS 500s the
+        # /music/<track id>/ form for them, while /music/<coverid>/ works.
+        k, u, h = mod._art_url(CFG, {"coverid": "e61ff6eb", "id": 137045,
+                                     "remote": "1"})
+        self.assertEqual(k, "cid:e61ff6eb")
+        self.assertEqual(h, "")
+        self.assertIn("/music/e61ff6eb/cover_1200x1200_o.png", u)
+
     def test_placeholder_passthrough(self):
         _, u, h = mod._art_url(CFG, {"artwork_url": "/html/images/cover.png"})
         self.assertEqual(h, "")
@@ -138,6 +147,80 @@ class TestParse(unittest.TestCase):
         st = {"mode": "play", "playerid": "aa",
               "playlist_loop": [{"title": "t", "remote_title": "x"}]}
         self.assertEqual(mod.NowPlaying.parse(CFG, st).station, "")
+
+
+class TestLibraryArtworkFill(unittest.TestCase):
+    """status drops artwork_url (K) for online-library rows; LMSClient
+    patches it back in from songinfo so the hi-res path applies."""
+    ART = f"/imageproxy/https%3A%2F%2Fi.scdn.co%2Fimage%2F{LO}{HASH}/image.png"
+
+    def make_client(self, songinfo=None, fail=False):
+        cfg = types.SimpleNamespace(base_url="http://lms:9000",
+                                    request_timeout=1.0)
+        client = mod.LMSClient(cfg)
+        calls = []
+
+        def request(player, cmd):
+            calls.append(cmd)
+            if cmd[0] == "status":
+                return {"mode": "play", "playlist_loop": [
+                    {"id": 137045, "coverid": "e61ff6eb", "remote": "1"},
+                    {"id": 137046, "coverid": "e61ff6eb", "remote": "1"}]}
+            if fail:
+                raise OSError("boom")
+            return songinfo if songinfo is not None else {"songinfo_loop": [
+                {"id": int(cmd[3].split(":")[1])},
+                {"artwork_url": self.ART}]}
+
+        client.request = request
+        return client, calls
+
+    def test_fills_current_and_next_then_hires(self):
+        client, _ = self.make_client()
+        st = client.status("aa")
+        for entry in st["playlist_loop"]:
+            self.assertEqual(entry["artwork_url"], self.ART)
+        np = mod.NowPlaying.parse(CFG, st)
+        self.assertIn(HI + HASH, np.cover_hires_url)
+        self.assertIn(HI + HASH, np.next_cover_hires_url)
+
+    def test_lookup_cached_per_track(self):
+        client, calls = self.make_client()
+        client.status("aa")
+        client.status("aa")
+        self.assertEqual(sum(c[0] == "songinfo" for c in calls), 2)
+
+    def test_lookup_failure_falls_back_to_coverid(self):
+        client, calls = self.make_client(fail=True)
+        st = client.status("aa")
+        np = mod.NowPlaying.parse(CFG, st)
+        self.assertEqual(np.cover_key, "cid:e61ff6eb")
+        self.assertIn("/music/e61ff6eb/", np.cover_url)
+        client.status("aa")   # failures aren't cached: retried next sweep
+        self.assertEqual(sum(c[0] == "songinfo" for c in calls), 4)
+
+    def test_no_artwork_cached_as_empty(self):
+        client, calls = self.make_client(songinfo={"songinfo_loop": [{"id": 1}]})
+        client.status("aa")
+        client.status("aa")
+        self.assertEqual(sum(c[0] == "songinfo" for c in calls), 2)
+
+    def test_skips_local_streams_and_entries_with_art(self):
+        client, calls = self.make_client()
+        loop = [{"id": 5, "coverid": "x", "remote": "0"},
+                {"id": -140, "coverid": "y", "remote": 1},
+                {"id": 6, "remote": "1", "artwork_url": "/keep"}]
+        client._fill_library_artwork(loop)
+        self.assertEqual(calls, [])
+        self.assertNotIn("artwork_url", loop[0])
+        self.assertEqual(loop[2]["artwork_url"], "/keep")
+
+    def test_cache_bounded(self):
+        client, _ = self.make_client()
+        client.LIB_ART_CAP = 3
+        for tid in range(1, 6):
+            client._fill_library_artwork([{"id": tid, "remote": 1}])
+        self.assertEqual(list(client._lib_art), [3, 4, 5])
 
 
 class TestRadioIdent(unittest.TestCase):

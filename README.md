@@ -18,7 +18,9 @@ framebuffer** (`/dev/fb0`), light enough for a **Raspberry Pi 3 A+ (512MB)**.
 - **Powers HDMI off when idle** (`vcgencmd`), wakes on play.
 - **Hi-res Spotify covers:** Spotify's CDN serves the same album art at 2000px
   under a different URL prefix. The display derives that URL itself (works
-  with stock Spotty): the next track's cover is prefetched hi-res, so album
+  with stock Spotty and Spot On, including albums imported into the LMS
+  library — their cover URL is looked up via `songinfo`, since `status`
+  omits it for library rows): the next track's cover is prefetched hi-res, so album
   swaps are instant *and* full quality; a manual skip paints the fast 640px
   variant immediately and crossfades to hi-res a couple of seconds later.
 - **Radio covers:** for internet-radio songs (with an album tag) it looks up
